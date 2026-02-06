@@ -756,7 +756,7 @@ function buildMemoryInstruction(config: SelfLearningConfig): string {
     strictPrefix,
     "Memory policy:",
     "1) Start from core/CORE.md for durable learnings.",
-    "2) For historical questions, check daily/*.md then monthly/*.md."
+    "2) For historical questions, check daily/*.md then monthly/*.md.",
     "3) Prefer evidence from memory files over guessing.",
     "4) If evidence is missing, explicitly state that and suggest searching memory logs.",
   ].join("\n");
