@@ -83,8 +83,8 @@ const DEFAULT_CONFIG: SelfLearningConfig = {
   context: {
     enabled: true,
     includeCore: true,
-    includeLatestMonthly: true,
-    includeLastNDaily: 3,
+    includeLatestMonthly: false,
+    includeLastNDaily: 0,
     maxChars: 12000,
     instructionMode: "strict",
   },
@@ -480,53 +480,191 @@ function gitCommit(root: string, files: string[], message: string, config: SelfL
   spawnSync("git", ["-C", root, "commit", "-m", message], { encoding: "utf-8" });
 }
 
+type CoreKind = "learning" | "antiPattern";
+
+type CoreIndexRecord = {
+  key: string;
+  text: string;
+  kind: CoreKind;
+  hits: number;
+  score: number;
+  firstSeen: string;
+  lastSeen: string;
+};
+
+type CoreIndex = {
+  version: 1;
+  updatedAt: string;
+  items: CoreIndexRecord[];
+};
+
+function coreIndexFile(root: string): string {
+  return join(coreDir(root), "index.json");
+}
+
 function parseCoreItems(text: string): string[] {
   return text
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.startsWith("- "))
     .map((line) => line.slice(2).trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((line) => line !== "(none yet)");
 }
 
-function writeCoreItems(root: string, items: string[]): string {
-  const file = ensureCoreFile(root);
+function normalizeLearningText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function learningKey(text: string): string {
+  return normalizeLearningText(text).toLowerCase();
+}
+
+function loadCoreIndex(root: string): CoreIndex {
+  const indexPath = coreIndexFile(root);
+  if (existsSync(indexPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(indexPath, "utf-8")) as unknown;
+      if (isPlainObject(parsed) && Array.isArray(parsed.items)) {
+        const items = parsed.items
+          .filter((it) => isPlainObject(it))
+          .map((it) => ({
+            key: String(it.key || ""),
+            text: String(it.text || "").trim(),
+            kind: it.kind === "antiPattern" ? "antiPattern" : "learning",
+            hits: Number.isFinite(Number(it.hits)) ? Number(it.hits) : 1,
+            score: Number.isFinite(Number(it.score)) ? Number(it.score) : 1,
+            firstSeen: String(it.firstSeen || new Date().toISOString()),
+            lastSeen: String(it.lastSeen || new Date().toISOString()),
+          }))
+          .filter((it) => it.key && it.text);
+
+        return {
+          version: 1,
+          updatedAt: String(parsed.updatedAt || new Date().toISOString()),
+          items,
+        };
+      }
+    } catch {
+      // fall through to migration/default
+    }
+  }
+
+  const corePath = ensureCoreFile(root);
+  const migrated = parseCoreItems(readFileSync(corePath, "utf-8")).map((text) => ({
+    key: learningKey(text),
+    text,
+    kind: text.toLowerCase().startsWith("avoid:") ? ("antiPattern" as const) : ("learning" as const),
+    hits: 1,
+    score: 1,
+    firstSeen: new Date().toISOString(),
+    lastSeen: new Date().toISOString(),
+  }));
+
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    items: migrated,
+  };
+}
+
+function saveCoreIndex(root: string, index: CoreIndex): string {
+  const file = coreIndexFile(root);
+  mkdirSync(coreDir(root), { recursive: true });
+  writeFileSync(file, `${JSON.stringify(index, null, 2)}\n`, "utf-8");
+  return file;
+}
+
+function effectiveScore(item: CoreIndexRecord): number {
+  const ageMs = Date.now() - Date.parse(item.lastSeen);
+  const ageDays = Number.isFinite(ageMs) && ageMs > 0 ? ageMs / (1000 * 60 * 60 * 24) : 0;
+  const recencyPenalty = ageDays * 0.05;
+  const kindBoost = item.kind === "antiPattern" ? 0.2 : 0;
+  return item.score + kindBoost - recencyPenalty;
+}
+
+function renderCoreFromIndex(root: string, index: CoreIndex, maxItems: number): string {
+  const sorted = [...index.items]
+    .sort((a, b) => {
+      const scoreDelta = effectiveScore(b) - effectiveScore(a);
+      if (Math.abs(scoreDelta) > 0.0001) return scoreDelta;
+      if (b.hits !== a.hits) return b.hits - a.hits;
+      return Date.parse(b.lastSeen) - Date.parse(a.lastSeen);
+    })
+    .slice(0, Math.max(1, maxItems));
+
+  const learnings = sorted.filter((x) => x.kind === "learning");
+  const antiPatterns = sorted.filter((x) => x.kind === "antiPattern");
+
   const content = [
     "# Core Learnings",
     "",
     "Most important durable learnings collected over time.",
     `Last updated: ${new Date().toISOString()}`,
     "",
-    "## Learnings",
-    ...items.map((item) => `- ${item}`),
+    "Ranked by frequency + recency (with light decay over time).",
+    "",
+    "## High-value learnings",
+    ...(learnings.length > 0 ? learnings.map((item) => `- ${item.text}`) : ["- (none yet)"]),
+    "",
+    "## Watch-outs",
+    ...(antiPatterns.length > 0
+      ? antiPatterns.map((item) => `- ${item.text.replace(/^avoid:\s*/i, "")}`)
+      : ["- (none yet)"]),
     "",
   ].join("\n");
 
+  const file = ensureCoreFile(root);
   writeFileSync(file, content, "utf-8");
   return file;
 }
 
-function updateCoreFromReflection(root: string, reflection: LearningReflection, maxItems: number): string {
-  const file = ensureCoreFile(root);
-  const existing = parseCoreItems(readFileSync(file, "utf-8"));
+function updateCoreFromReflection(root: string, reflection: LearningReflection, maxItems: number): string[] {
+  const index = loadCoreIndex(root);
+  const nowIso = new Date().toISOString();
 
-  const incoming = [
-    ...reflection.learnings,
-    ...reflection.antiPatterns.map((a) => `Avoid: ${a}`),
-  ].map((x) => x.trim()).filter(Boolean);
+  const updates: Array<{ text: string; kind: CoreKind }> = [
+    ...reflection.learnings.map((text) => ({ text, kind: "learning" as const })),
+    ...reflection.antiPatterns.map((text) => ({ text: `Avoid: ${text}`, kind: "antiPattern" as const })),
+  ]
+    .map((entry) => ({ text: normalizeLearningText(entry.text), kind: entry.kind }))
+    .filter((entry) => entry.text.length > 0);
 
-  const seen = new Set<string>();
-  const merged: string[] = [];
+  const byKey = new Map(index.items.map((item) => [item.key, item]));
 
-  for (const item of [...incoming, ...existing]) {
-    const key = item.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(item);
-    if (merged.length >= maxItems) break;
+  for (const entry of updates) {
+    const key = learningKey(entry.text);
+    const existing = byKey.get(key);
+
+    if (!existing) {
+      byKey.set(key, {
+        key,
+        text: entry.text,
+        kind: entry.kind,
+        hits: 1,
+        score: entry.kind === "antiPattern" ? 1.2 : 1,
+        firstSeen: nowIso,
+        lastSeen: nowIso,
+      });
+      continue;
+    }
+
+    existing.text = entry.text;
+    existing.kind = entry.kind;
+    existing.hits += 1;
+    existing.lastSeen = nowIso;
+
+    const incrementBase = entry.kind === "antiPattern" ? 1.2 : 1;
+    const repetitionBonus = Math.min(1, existing.hits * 0.08);
+    existing.score += incrementBase + repetitionBonus;
   }
 
-  return writeCoreItems(root, merged.length ? merged : ["(none yet)"]);
+  index.updatedAt = nowIso;
+  index.items = [...byKey.values()];
+
+  const renderedCore = renderCoreFromIndex(root, index, Math.max(10, maxItems));
+  const indexFile = saveCoreIndex(root, index);
+  return [renderedCore, indexFile];
 }
 
 function collectMonthDailyFiles(root: string, month: string): string[] {
@@ -579,17 +717,17 @@ function buildMemoryContextBundle(root: string, config: SelfLearningConfig): str
     }
   }
 
-  if (config.context.includeLatestMonthly) {
-    const monthly = latestMonthlyFile(root);
-    if (monthly && existsSync(monthly)) {
-      sections.push(`## ${relative(root, monthly)}\n${readTrimmedFile(monthly, maxPerFile)}`);
-    }
-  }
-
   const dailyTake = Math.max(0, config.context.includeLastNDaily || 0);
   if (dailyTake > 0) {
     for (const daily of latestDailyFiles(root, dailyTake)) {
       sections.push(`## ${relative(root, daily)}\n${readTrimmedFile(daily, maxPerFile)}`);
+    }
+  }
+
+  if (config.context.includeLatestMonthly) {
+    const monthly = latestMonthlyFile(root);
+    if (monthly && existsSync(monthly)) {
+      sections.push(`## ${relative(root, monthly)}\n${readTrimmedFile(monthly, maxPerFile)}`);
     }
   }
 
@@ -618,7 +756,7 @@ function buildMemoryInstruction(config: SelfLearningConfig): string {
     strictPrefix,
     "Memory policy:",
     "1) Start from core/CORE.md for durable learnings.",
-    "2) For historical questions, check monthly/*.md then daily/*.md.",
+    "2) For historical questions, check daily/*.md then monthly/*.md."
     "3) Prefer evidence from memory files over guessing.",
     "4) If evidence is missing, explicitly state that and suggest searching memory logs.",
   ].join("\n");
@@ -668,9 +806,9 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<{ f
   ensureGitRepo(root, config);
 
   const dailyFile = appendDailyEntry(root, now, entry);
-  const core = updateCoreFromReflection(root, parsed, Math.max(10, config.maxCoreItems || 150));
+  const coreFiles = updateCoreFromReflection(root, parsed, Math.max(10, config.maxCoreItems || 150));
 
-  gitCommit(root, [dailyFile, core], `chore(memory): ${toDateKeyUTC(now)} ${turnLabel.toLowerCase()}`, config);
+  gitCommit(root, [dailyFile, ...coreFiles], `chore(memory): ${toDateKeyUTC(now)} ${turnLabel.toLowerCase()}`, config);
 
   const shortSummary = parsed.summary.slice(0, 180);
   RUNTIME_NOTES.push(shortSummary);

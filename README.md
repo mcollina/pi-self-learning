@@ -15,7 +15,8 @@ After each turn (when enabled), it:
 2. extracts learnings, anti-patterns, and next-turn advice,
 3. appends the entry to a daily markdown file,
 4. updates `core/CORE.md` with important durable learnings,
-5. commits changes in a dedicated memory git repository.
+5. maintains a scored `core/index.json` (frequency + recency),
+6. commits changes in a dedicated memory git repository.
 
 ## Memory folder layout
 
@@ -30,7 +31,8 @@ Default project path: `.pi/self-learning-memory`
 ├── monthly/
 │   └── YYYY-MM.md
 └── core/
-    └── CORE.md
+    ├── CORE.md
+    └── index.json
 ```
 
 ## Installation
@@ -86,8 +88,8 @@ Project `.pi/settings.json`:
     "context": {
       "enabled": true,
       "includeCore": true,
-      "includeLatestMonthly": true,
-      "includeLastNDaily": 3,
+      "includeLatestMonthly": false,
+      "includeLastNDaily": 0,
       "maxChars": 12000,
       "instructionMode": "strict"
     },
@@ -107,9 +109,9 @@ Project `.pi/settings.json`:
 
 Use `selfLearning.context` to inject memory into each turn:
 
-- `includeCore`: inject `core/CORE.md`
-- `includeLatestMonthly`: inject latest `monthly/YYYY-MM.md`
-- `includeLastNDaily`: inject last N daily files from `daily/`
+- `includeCore`: inject `core/CORE.md` (enabled by default)
+- `includeLatestMonthly`: inject latest `monthly/YYYY-MM.md` (disabled by default)
+- `includeLastNDaily`: inject last N daily files from `daily/` (default `0`)
 - `instructionMode`:
   - `off`: do not add memory policy to system prompt
   - `advisory`: suggest checking memory logs
@@ -117,7 +119,7 @@ Use `selfLearning.context` to inject memory into each turn:
 
 With `instructionMode: "strict"`, the extension appends policy telling the assistant to:
 1. consult `core/CORE.md` first,
-2. check `monthly/*.md` then `daily/*.md` for historical questions,
+2. check `daily/*.md` then `monthly/*.md` for historical questions,
 3. prefer evidence over guessing.
 
 ## Commands

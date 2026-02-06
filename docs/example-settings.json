@@ -18,8 +18,8 @@
     "context": {
       "enabled": true,
       "includeCore": true,
-      "includeLatestMonthly": true,
-      "includeLastNDaily": 3,
+      "includeLatestMonthly": false,
+      "includeLastNDaily": 0,
       "maxChars": 12000,
       "instructionMode": "strict"
     },
