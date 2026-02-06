@@ -128,6 +128,7 @@ With `instructionMode: "strict"`, the extension appends policy telling the assis
 - `/learning-month [YYYY-MM]` → generate monthly summary
 - `/learning-daily` → show today’s daily file path
 - `/learning-toggle` → enable/disable for current branch
+- `/learning-model` → open model selector (available models)
 - `/learning-model <provider/id> | reset` → set/reset branch model override
 - `/learning-model-global <provider/id> | reset | show` → set/reset/show global model in `~/.pi/agent/settings.json`
 - `/learning-status` → show effective config and model resolution

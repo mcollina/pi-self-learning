@@ -44,10 +44,12 @@ type SelfLearningConfig = {
     maxChars: number;
     instructionMode: "off" | "advisory" | "strict";
   };
-  model?: {
-    provider?: string;
-    id?: string;
-  };
+  model?:
+    | {
+        provider?: string;
+        id?: string;
+      }
+    | string;
 };
 
 type LearningReflection = {
@@ -55,6 +57,23 @@ type LearningReflection = {
   learnings: string[];
   antiPatterns: string[];
   nextTurnAdvice: string[];
+};
+
+type ReflectionSkipReason =
+  | "disabled"
+  | "no_messages"
+  | "empty_conversation"
+  | "no_model"
+  | "empty_model_output"
+  | "invalid_model_output";
+
+type ReflectNowResult = {
+  file?: string;
+  summary?: string;
+  reason?: ReflectionSkipReason;
+  rawModelOutput?: string;
+  repairModelOutput?: string;
+  diagnostics?: string[];
 };
 
 type SessionEntry = {
@@ -283,6 +302,100 @@ function parseReflection(raw: string): LearningReflection | undefined {
   }
 }
 
+function extractFirstJsonObject(text: string): string | undefined {
+  const input = stripCodeFence(text);
+  const start = input.indexOf("{");
+  if (start === -1) return undefined;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < input.length; i++) {
+    const ch = input[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === "{") {
+      depth += 1;
+      continue;
+    }
+
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return input.slice(start, i + 1).trim();
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function parseReflectionWithFallback(raw: string): LearningReflection | undefined {
+  const direct = parseReflection(raw);
+  if (direct) return direct;
+
+  const extracted = extractFirstJsonObject(raw);
+  if (!extracted) return undefined;
+
+  return parseReflection(extracted);
+}
+
+function buildReflectionRepairPrompt(rawModelOutput: string): string {
+  return [
+    "Convert the following model output into STRICT JSON only.",
+    "Return exactly one JSON object with this schema:",
+    '{"summary":"string","learnings":["..."],"antiPatterns":["..."],"nextTurnAdvice":["..."]}',
+    "Do not add markdown fences. Do not add commentary.",
+    "If information is missing, use empty arrays and a short summary.",
+    "",
+    "<raw_output>",
+    compactText(rawModelOutput, 6000),
+    "</raw_output>",
+  ].join("\n");
+}
+
+function extractTextFromResponseContent(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .filter((c): c is { type: string; text?: unknown } => isPlainObject(c) && typeof c.type === "string")
+    .map((c) => (c.type === "text" && typeof c.text === "string" ? c.text : ""))
+    .join("\n")
+    .trim();
+}
+
+function previewResponseContent(content: unknown, maxChars = 1200): string {
+  if (!Array.isArray(content) || content.length === 0) return "(empty response content)";
+
+  const rendered = content
+    .map((item) => {
+      try {
+        return JSON.stringify(item);
+      } catch {
+        return String(item);
+      }
+    })
+    .join("\n");
+
+  return compactText(rendered, maxChars);
+}
+
 function buildReflectionPrompt(conversationText: string, maxLearnings: number): string {
   return [
     "You are a coding session reflection engine.",
@@ -397,47 +510,110 @@ function getRuntimeModelOverride(ctx: ExtensionContext): ModelRef | undefined {
 }
 
 function configuredModel(config: SelfLearningConfig): ModelRef | undefined {
-  if (config.model?.provider && config.model?.id) {
-    return { provider: config.model.provider, id: config.model.id };
+  const raw = config.model as unknown;
+
+  if (typeof raw === "string") {
+    return parseModelRef(raw);
   }
+
+  if (isPlainObject(raw) && typeof raw.provider === "string" && typeof raw.id === "string") {
+    return { provider: raw.provider, id: raw.id };
+  }
+
   return undefined;
 }
 
+async function getAvailableModelRefs(ctx: ExtensionContext): Promise<ModelRef[]> {
+  try {
+    const registry = ctx.modelRegistry as unknown as {
+      getAvailable?: () => Promise<Array<{ provider?: string; id?: string }>>;
+    };
+
+    const models = (await registry.getAvailable?.()) ?? [];
+    return models
+      .filter((m) => typeof m?.provider === "string" && typeof m?.id === "string")
+      .map((m) => ({ provider: m.provider as string, id: m.id as string }))
+      .sort((a, b) => {
+        const providerDelta = a.provider.localeCompare(b.provider);
+        if (providerDelta !== 0) return providerDelta;
+        return a.id.localeCompare(b.id);
+      });
+  } catch {
+    return [];
+  }
+}
+
 async function pickReflectionModel(config: SelfLearningConfig, ctx: ExtensionContext) {
-  const candidates = [] as NonNullable<ReturnType<typeof getModel>>[];
+  const diagnostics: string[] = [];
 
-  const runtimeModel = getRuntimeModelOverride(ctx);
+  let validModelsCache: string[] | undefined;
+  const getValidModels = async (): Promise<string[]> => {
+    if (validModelsCache) return validModelsCache;
+
+    try {
+      const registry = ctx.modelRegistry as unknown as {
+        getAvailable?: () => Promise<Array<{ provider?: string; id?: string }>>;
+      };
+
+      const available = (await registry.getAvailable?.()) ?? [];
+      validModelsCache = available
+        .filter((m) => typeof m?.provider === "string" && typeof m?.id === "string")
+        .map((m) => `${m.provider}/${m.id}`)
+        .sort();
+    } catch {
+      validModelsCache = [];
+    }
+
+    return validModelsCache;
+  };
+
+  const pushValidModels = async () => {
+    const valid = await getValidModels();
+    if (valid.length === 0) {
+      diagnostics.push("valid_models=(unavailable from model registry)");
+      return;
+    }
+
+    const shown = valid.slice(0, 40);
+    const suffix = valid.length > shown.length ? ` ... (+${valid.length - shown.length} more)` : "";
+    diagnostics.push(`valid_models=${shown.join(", ")}${suffix}`);
+  };
+
   const fromConfig = configuredModel(config);
-
-  if (runtimeModel) {
-    const chosen = getModel(runtimeModel.provider, runtimeModel.id);
-    if (chosen) candidates.push(chosen);
-  }
-
   if (fromConfig) {
-    const chosen = getModel(fromConfig.provider, fromConfig.id);
-    if (chosen) candidates.push(chosen);
+    const registry = ctx.modelRegistry as unknown as {
+      find?: (provider: string, id: string) => NonNullable<ReturnType<typeof getModel>> | undefined;
+    };
+
+    const configured = registry.find?.(fromConfig.provider, fromConfig.id) ?? getModel(fromConfig.provider, fromConfig.id);
+    if (!configured) {
+      diagnostics.push(`config_model_not_found=${fromConfig.provider}/${fromConfig.id}`);
+      await pushValidModels();
+    } else {
+      const apiKey = await ctx.modelRegistry.getApiKey(configured);
+      if (apiKey) {
+        diagnostics.push(`selected=config:${configured.provider}/${configured.id}`);
+        return { model: configured, apiKey, diagnostics };
+      }
+      diagnostics.push(`config_model_api_key_missing=${configured.provider}/${configured.id}`);
+      await pushValidModels();
+    }
+  } else {
+    diagnostics.push("config_model=(none)");
   }
 
-  const flash = getModel("google", "gemini-2.5-flash");
-  if (flash) candidates.push(flash);
-
-  const mini = getModel("openai", "gpt-5-mini");
-  if (mini) candidates.push(mini);
-
-  if (ctx.model) candidates.push(ctx.model);
-
-  const deduped = new Set<string>();
-  for (const model of candidates) {
-    const key = `${model.provider}/${model.id}`;
-    if (deduped.has(key)) continue;
-    deduped.add(key);
-
-    const apiKey = await ctx.modelRegistry.getApiKey(model);
-    if (apiKey) return { model, apiKey };
+  if (ctx.model) {
+    const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+    if (apiKey) {
+      diagnostics.push(`selected=current:${ctx.model.provider}/${ctx.model.id}`);
+      return { model: ctx.model, apiKey, diagnostics };
+    }
+    diagnostics.push(`current_model_api_key_missing=${ctx.model.provider}/${ctx.model.id}`);
+  } else {
+    diagnostics.push("current_model=(none)");
   }
 
-  return undefined;
+  return { diagnostics };
 }
 
 function isLearningEnabled(config: SelfLearningConfig, ctx: ExtensionContext): boolean {
@@ -762,20 +938,44 @@ function buildMemoryInstruction(config: SelfLearningConfig): string {
   ].join("\n");
 }
 
-async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<{ file?: string; summary?: string }> {
+function describeReflectionSkipReason(reason: ReflectionSkipReason): string {
+  switch (reason) {
+    case "disabled":
+      return "self-learning is disabled (settings or /learning-toggle override)";
+    case "no_messages":
+      return "no recent messages were found in this branch";
+    case "empty_conversation":
+      return "conversation serialization produced empty content";
+    case "no_model":
+      return "no reflection model with an available API key could be resolved";
+    case "empty_model_output":
+      return "the model returned no text output for reflection";
+    case "invalid_model_output":
+      return "the model output could not be parsed as the required reflection JSON, even after extraction and repair";
+  }
+}
+
+async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<ReflectNowResult> {
   const settings = loadMergedSettings(ctx.cwd);
   const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
 
-  if (!isLearningEnabled(config, ctx)) return {};
+  if (!isLearningEnabled(config, ctx)) return { reason: "disabled" };
 
   const messages = getBranchMessages(ctx, config.maxMessagesForReflection);
-  if (messages.length === 0) return {};
+  if (messages.length === 0) return { reason: "no_messages" };
 
   const conversationText = serializeConversation(convertToLlm(messages as any));
-  if (!conversationText.trim()) return {};
+  if (!conversationText.trim()) return { reason: "empty_conversation" };
 
   const picked = await pickReflectionModel(config, ctx);
-  if (!picked) return {};
+  if (!picked.model || !picked.apiKey) {
+    return {
+      reason: "no_model",
+      diagnostics: [...picked.diagnostics, "resolved_model=(none with available API key)"],
+    };
+  }
+
+  const resolvedModel = `${picked.model.provider}/${picked.model.id}`;
 
   const response = await complete(
     picked.model,
@@ -791,14 +991,61 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<{ f
     { apiKey: picked.apiKey, maxTokens: 900 },
   );
 
-  const raw = response.content
-    .filter((c): c is { type: "text"; text: string } => c.type === "text")
-    .map((c) => c.text)
-    .join("\n")
-    .trim();
+  const raw = extractTextFromResponseContent(response.content);
+  const rawPreview = raw ? compactText(raw, 1200) : previewResponseContent(response.content, 1200);
 
-  const parsed = parseReflection(raw);
-  if (!parsed) return {};
+  if (!raw) {
+    return {
+      reason: "empty_model_output",
+      rawModelOutput: rawPreview,
+      diagnostics: [
+        ...picked.diagnostics,
+        `resolved_model=${resolvedModel}`,
+        `response_items=${Array.isArray(response.content) ? response.content.length : 0}`,
+      ],
+    };
+  }
+
+  let parsed = parseReflectionWithFallback(raw);
+  let repairRaw: string | undefined;
+  let repairPreview: string | undefined;
+  let repairResponseItems = 0;
+
+  if (!parsed) {
+    const repairResponse = await complete(
+      picked.model,
+      {
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: buildReflectionRepairPrompt(raw) }],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      { apiKey: picked.apiKey, maxTokens: 900 },
+    );
+
+    repairResponseItems = Array.isArray(repairResponse.content) ? repairResponse.content.length : 0;
+    repairRaw = extractTextFromResponseContent(repairResponse.content);
+    repairPreview = repairRaw ? compactText(repairRaw, 1200) : previewResponseContent(repairResponse.content, 1200);
+
+    parsed = repairRaw ? parseReflectionWithFallback(repairRaw) : undefined;
+  }
+
+  if (!parsed) {
+    return {
+      reason: "invalid_model_output",
+      rawModelOutput: rawPreview,
+      repairModelOutput: repairPreview,
+      diagnostics: [
+        ...picked.diagnostics,
+        `resolved_model=${resolvedModel}`,
+        `initial_response_items=${Array.isArray(response.content) ? response.content.length : 0}`,
+        `repair_response_items=${repairResponseItems}`,
+      ],
+    };
+  }
 
   const now = new Date();
   const entry = buildMarkdownEntry(now, turnLabel, parsed);
@@ -836,7 +1083,7 @@ async function generateMonthSummary(
   );
 
   const picked = await pickReflectionModel(config, ctx);
-  if (!picked) return { dailyCount: files.length };
+  if (!picked.model || !picked.apiKey) return { dailyCount: files.length };
 
   const response = await complete(
     picked.model,
@@ -929,7 +1176,25 @@ export default function (pi: ExtensionAPI) {
       try {
         const result = await reflectNow("Manual", ctx);
         if (!result.file) {
-          ctx.ui.notify("No reflection generated", "warning");
+          const detail = result.reason ? describeReflectionSkipReason(result.reason) : "unknown reason";
+          let message = `No reflection generated: ${detail}`;
+
+          if (result.diagnostics && result.diagnostics.length > 0) {
+            message += `\nDiagnostics:\n${result.diagnostics.map((d) => `- ${d}`).join("\n")}`;
+          }
+
+          if (result.reason === "empty_model_output") {
+            const rawPreview = result.rawModelOutput ? compactText(result.rawModelOutput, 500) : "(none)";
+            message += `\nInitial output:\n${rawPreview}`;
+          }
+
+          if (result.reason === "invalid_model_output") {
+            const rawPreview = result.rawModelOutput ? compactText(result.rawModelOutput, 500) : "(none)";
+            const repairPreview = result.repairModelOutput ? compactText(result.repairModelOutput, 500) : "(none)";
+            message += `\nInitial output:\n${rawPreview}\n\nRepair attempt output:\n${repairPreview}`;
+          }
+
+          ctx.ui.notify(message, "warning");
           return;
         }
         ctx.ui.notify(`Reflection saved to ${result.file}`, "info");
@@ -981,21 +1246,62 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("learning-model", {
-    description: "Set summarization model: /learning-model <provider/id> | reset",
+    description: "Set summarization model: /learning-model (selector) or /learning-model <provider/id> | reset",
     handler: async (args, ctx) => {
       const raw = args.trim();
       if (!raw) {
-        const runtimeModel = getRuntimeModelOverride(ctx);
         const settings = loadMergedSettings(ctx.cwd);
         const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
         const configModel = configuredModel(config);
-        const active = runtimeModel ?? configModel;
+        const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
 
-        if (active) {
-          ctx.ui.notify(`Current learning model: ${active.provider}/${active.id}`, "info");
-        } else {
-          ctx.ui.notify("No specific learning model set (using fallback order)", "info");
+        const models = await getAvailableModelRefs(ctx);
+        if (models.length === 0) {
+          ctx.ui.notify("No available models found in model registry", "warning");
+          return;
         }
+
+        const configuredLabel = configModel ? `${configModel.provider}/${configModel.id}` : "(none)";
+        const selectorTitle = `Select learning reflection model (configured: ${configuredLabel} | current: ${currentModel})`;
+
+        const options = ["reset", ...models.map((m) => `${m.provider}/${m.id}`)];
+        const selected = await ctx.ui.select(selectorTitle, options);
+        if (!selected) return;
+
+        if (selected === "reset") {
+          pi.appendEntry(MODEL_ENTRY, { reset: true, ts: Date.now() });
+          ctx.ui.notify("Learning model override cleared for this branch", "info");
+          return;
+        }
+
+        const parsedFromSelection = parseModelRef(selected);
+        if (!parsedFromSelection) {
+          ctx.ui.notify(`Invalid model selection: ${selected}`, "warning");
+          return;
+        }
+
+        const registry = ctx.modelRegistry as unknown as {
+          find?: (provider: string, id: string) => NonNullable<ReturnType<typeof getModel>> | undefined;
+        };
+        const selectedModel =
+          registry.find?.(parsedFromSelection.provider, parsedFromSelection.id) ??
+          getModel(parsedFromSelection.provider, parsedFromSelection.id);
+        if (!selectedModel) {
+          ctx.ui.notify(`Model not found: ${parsedFromSelection.provider}/${parsedFromSelection.id}`, "warning");
+          return;
+        }
+
+        const selectedApiKey = await ctx.modelRegistry.getApiKey(selectedModel);
+        if (!selectedApiKey) {
+          ctx.ui.notify(`No API key available for ${parsedFromSelection.provider}/${parsedFromSelection.id}`, "warning");
+        }
+
+        pi.appendEntry(MODEL_ENTRY, {
+          provider: parsedFromSelection.provider,
+          id: parsedFromSelection.id,
+          ts: Date.now(),
+        });
+        ctx.ui.notify(`Learning model set to ${parsedFromSelection.provider}/${parsedFromSelection.id}`, "info");
         return;
       }
 
@@ -1096,7 +1402,18 @@ export default function (pi: ExtensionAPI) {
       const root = resolveStorageRoot(config, ctx.cwd);
       const runtimeModel = getRuntimeModelOverride(ctx);
       const configModel = configuredModel(config);
-      const model = runtimeModel ?? configModel;
+      const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
+
+      let configModelStatus = "not configured";
+      if (configModel) {
+        const model = getModel(configModel.provider, configModel.id);
+        if (!model) {
+          configModelStatus = "configured but not found in model registry";
+        } else {
+          const apiKey = await ctx.modelRegistry.getApiKey(model);
+          configModelStatus = apiKey ? "configured and API key available" : "configured but API key missing";
+        }
+      }
 
       const globalSettings = loadJsonFile(globalSettingsPath());
       const globalModel = parseModelRef(
@@ -1116,9 +1433,15 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`selfLearning.context.maxChars=${config.context.maxChars}`, "info");
       ctx.ui.notify(`selfLearning.context.instructionMode=${config.context.instructionMode}`, "info");
       ctx.ui.notify(
-        model
-          ? `selfLearning.model=${model.provider}/${model.id}${runtimeModel ? " (runtime override)" : " (merged settings)"}`
-          : "selfLearning.model=(fallback order)",
+        configModel
+          ? `selfLearning.model=${configModel.provider}/${configModel.id} (configured)`
+          : "selfLearning.model=(none configured; using current session model)",
+        "info",
+      );
+      ctx.ui.notify(`selfLearning.model.configStatus=${configModelStatus}`, "info");
+      ctx.ui.notify(`selfLearning.model.currentSession=${currentModel}`, "info");
+      ctx.ui.notify(
+        `selfLearning.modelResolutionOrder=configured model -> current session model${runtimeModel ? " (runtime /learning-model override is currently ignored for reflection)" : ""}`,
         "info",
       );
       ctx.ui.notify(
