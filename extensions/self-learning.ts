@@ -36,6 +36,14 @@ type SelfLearningConfig = {
     enabled: boolean;
     autoCommit: boolean;
   };
+  context: {
+    enabled: boolean;
+    includeCore: boolean;
+    includeLatestMonthly: boolean;
+    includeLastNDaily: number;
+    maxChars: number;
+    instructionMode: "off" | "advisory" | "strict";
+  };
   model?: {
     provider?: string;
     id?: string;
@@ -71,6 +79,14 @@ const DEFAULT_CONFIG: SelfLearningConfig = {
   git: {
     enabled: true,
     autoCommit: true,
+  },
+  context: {
+    enabled: true,
+    includeCore: true,
+    includeLatestMonthly: true,
+    includeLastNDaily: 3,
+    maxChars: 12000,
+    instructionMode: "strict",
   },
 };
 
@@ -527,6 +543,87 @@ function compactText(input: string, maxChars: number): string {
   return `${input.slice(0, maxChars)}\n\n...(truncated)`;
 }
 
+function latestMonthlyFile(root: string): string | undefined {
+  const dir = monthlyDir(root);
+  if (!existsSync(dir)) return undefined;
+  const files = readdirSync(dir)
+    .filter((name) => /^\d{4}-\d{2}\.md$/.test(name))
+    .sort();
+  const latest = files.at(-1);
+  return latest ? join(dir, latest) : undefined;
+}
+
+function latestDailyFiles(root: string, take: number): string[] {
+  const dir = dailyDir(root);
+  if (!existsSync(dir)) return [];
+  const files = readdirSync(dir)
+    .filter((name) => /^\d{4}-\d{2}-\d{2}\.md$/.test(name))
+    .sort();
+  return files.slice(-Math.max(0, take)).map((name) => join(dir, name));
+}
+
+function readTrimmedFile(file: string, maxChars: number): string {
+  const raw = readFileSync(file, "utf-8").trim();
+  return compactText(raw, maxChars);
+}
+
+function buildMemoryContextBundle(root: string, config: SelfLearningConfig): string | undefined {
+  const sections: string[] = [];
+  const maxChars = Math.max(2000, config.context.maxChars || 12000);
+  const maxPerFile = Math.max(1000, Math.floor(maxChars / 4));
+
+  if (config.context.includeCore) {
+    const core = coreFile(root);
+    if (existsSync(core)) {
+      sections.push(`## core/CORE.md\n${readTrimmedFile(core, maxPerFile)}`);
+    }
+  }
+
+  if (config.context.includeLatestMonthly) {
+    const monthly = latestMonthlyFile(root);
+    if (monthly && existsSync(monthly)) {
+      sections.push(`## ${relative(root, monthly)}\n${readTrimmedFile(monthly, maxPerFile)}`);
+    }
+  }
+
+  const dailyTake = Math.max(0, config.context.includeLastNDaily || 0);
+  if (dailyTake > 0) {
+    for (const daily of latestDailyFiles(root, dailyTake)) {
+      sections.push(`## ${relative(root, daily)}\n${readTrimmedFile(daily, maxPerFile)}`);
+    }
+  }
+
+  if (sections.length === 0) return undefined;
+
+  return compactText(
+    [
+      "# Self-learning memory context",
+      "Use this as historical evidence.",
+      "",
+      ...sections,
+    ].join("\n\n"),
+    maxChars,
+  );
+}
+
+function buildMemoryInstruction(config: SelfLearningConfig): string {
+  if (config.context.instructionMode === "off") return "";
+
+  const strictPrefix =
+    config.context.instructionMode === "strict"
+      ? "You MUST consult self-learning memory when the user asks about history, prior decisions, patterns, regressions, or follow-up work."
+      : "Consult self-learning memory when relevant to history and prior decisions.";
+
+  return [
+    strictPrefix,
+    "Memory policy:",
+    "1) Start from core/CORE.md for durable learnings.",
+    "2) For historical questions, check monthly/*.md then daily/*.md.",
+    "3) Prefer evidence from memory files over guessing.",
+    "4) If evidence is missing, explicitly state that and suggest searching memory logs.",
+  ].join("\n");
+}
+
 async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<{ file?: string; summary?: string }> {
   const settings = loadMergedSettings(ctx.cwd);
   const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
@@ -656,20 +753,35 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     const settings = loadMergedSettings(ctx.cwd);
     const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
-    if (!isLearningEnabled(config, ctx) || RUNTIME_NOTES.length === 0) return;
+    if (!isLearningEnabled(config, ctx)) return;
 
-    const take = Math.max(1, config.injectLastN || 5);
-    const last = RUNTIME_NOTES.slice(-take).map((note) => `- ${note}`).join("\n");
+    const pieces: string[] = [];
+
+    if (RUNTIME_NOTES.length > 0) {
+      const take = Math.max(1, config.injectLastN || 5);
+      const last = RUNTIME_NOTES.slice(-take).map((note) => `- ${note}`).join("\n");
+      pieces.push(`## Recent turn notes\n${last}`);
+    }
+
+    if (config.context.enabled) {
+      const root = resolveStorageRoot(config, ctx.cwd);
+      const bundle = buildMemoryContextBundle(root, config);
+      if (bundle) pieces.push(bundle);
+    }
+
+    const instruction = config.context.enabled ? buildMemoryInstruction(config) : "";
+    if (pieces.length === 0 && !instruction) return;
 
     return {
-      message: {
-        customType: "self-learning-context",
-        content: `Recent self-learning notes:\n${last}`,
-        display: false,
-      },
-      systemPrompt:
-        event.systemPrompt +
-        "\n\nConsider recent self-learning notes if relevant, but prioritize explicit user intent.",
+      message:
+        pieces.length > 0
+          ? {
+              customType: "self-learning-context",
+              content: pieces.join("\n\n"),
+              display: false,
+            }
+          : undefined,
+      systemPrompt: instruction ? `${event.systemPrompt}\n\n${instruction}` : event.systemPrompt,
     };
   });
 
@@ -859,6 +971,12 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`selfLearning.storage.root=${root}`, "info");
       ctx.ui.notify(`selfLearning.git.enabled=${config.git.enabled}`, "info");
       ctx.ui.notify(`selfLearning.git.autoCommit=${config.git.autoCommit}`, "info");
+      ctx.ui.notify(`selfLearning.context.enabled=${config.context.enabled}`, "info");
+      ctx.ui.notify(`selfLearning.context.includeCore=${config.context.includeCore}`, "info");
+      ctx.ui.notify(`selfLearning.context.includeLatestMonthly=${config.context.includeLatestMonthly}`, "info");
+      ctx.ui.notify(`selfLearning.context.includeLastNDaily=${config.context.includeLastNDaily}`, "info");
+      ctx.ui.notify(`selfLearning.context.maxChars=${config.context.maxChars}`, "info");
+      ctx.ui.notify(`selfLearning.context.instructionMode=${config.context.instructionMode}`, "info");
       ctx.ui.notify(
         model
           ? `selfLearning.model=${model.provider}/${model.id}${runtimeModel ? " (runtime override)" : " (merged settings)"}`

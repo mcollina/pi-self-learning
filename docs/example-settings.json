@@ -5,6 +5,7 @@
     "injectLastN": 5,
     "maxMessagesForReflection": 8,
     "maxLearnings": 8,
+    "maxCoreItems": 150,
     "storage": {
       "mode": "project",
       "projectPath": ".pi/self-learning-memory",
@@ -13,6 +14,14 @@
     "git": {
       "enabled": true,
       "autoCommit": true
+    },
+    "context": {
+      "enabled": true,
+      "includeCore": true,
+      "includeLatestMonthly": true,
+      "includeLastNDaily": 3,
+      "maxChars": 12000,
+      "instructionMode": "strict"
     },
     "model": {
       "provider": "google",

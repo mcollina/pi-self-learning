@@ -83,6 +83,14 @@ Project `.pi/settings.json`:
       "enabled": true,
       "autoCommit": true
     },
+    "context": {
+      "enabled": true,
+      "includeCore": true,
+      "includeLatestMonthly": true,
+      "includeLastNDaily": 3,
+      "maxChars": 12000,
+      "instructionMode": "strict"
+    },
     "model": {
       "provider": "google",
       "id": "gemini-2.5-flash"
@@ -94,6 +102,23 @@ Project `.pi/settings.json`:
 `selfLearning.model` can be set in:
 - global `~/.pi/agent/settings.json` (global default)
 - project `.pi/settings.json` (project override)
+
+## Loading memory into context
+
+Use `selfLearning.context` to inject memory into each turn:
+
+- `includeCore`: inject `core/CORE.md`
+- `includeLatestMonthly`: inject latest `monthly/YYYY-MM.md`
+- `includeLastNDaily`: inject last N daily files from `daily/`
+- `instructionMode`:
+  - `off`: do not add memory policy to system prompt
+  - `advisory`: suggest checking memory logs
+  - `strict`: enforce checking memory logs for history-related questions
+
+With `instructionMode: "strict"`, the extension appends policy telling the assistant to:
+1. consult `core/CORE.md` first,
+2. check `monthly/*.md` then `daily/*.md` for historical questions,
+3. prefer evidence over guessing.
 
 ## Commands
 
