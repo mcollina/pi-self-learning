@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents like Claude Code (claude.ai/code
 
 - This repo is a **single pi extension package** (`pi-self-learning`).
 - Runtime logic is concentrated in **`extensions/self-learning.ts`**.
-- The extension implements a reflection loop: summarize recent conversation turns, persist learnings to markdown/json files, optionally commit to a dedicated memory git repo, and inject memory back into future prompts.
+- The extension implements a reflection loop: summarize recent conversation after completed agent tasks, persist learnings to markdown/json files, optionally commit to a dedicated memory git repo, and inject memory back into future prompts.
 
 ## Common commands in this repo
 
@@ -51,7 +51,7 @@ Place that in project `.pi/settings.json`.
 1. Read `README.md` first for installation/config/commands.
 2. Read `extensions/self-learning.ts` end-to-end before making behavior changes.
 3. Decide whether the change affects:
-   - reflection pipeline (`turn_end`)
+   - reflection pipeline (`agent_end`)
    - context injection (`before_agent_start`)
    - memory storage format (`daily`, `monthly`, `core/index.json`)
 4. If adding config, wire it through merged settings (global + project) and keep defaults in `DEFAULT_CONFIG`.
@@ -73,9 +73,9 @@ Place that in project `.pi/settings.json`.
 
 Settings merge is deep for plain objects (`deepMerge`).
 
-### 2) Turn-end reflection pipeline
+### 2) Task-end reflection pipeline
 
-On `turn_end` (when enabled and `autoAfterTurn`):
+On `agent_end` (when enabled and `autoAfterTask`):
 
 1. collect recent branch messages (`maxMessagesForReflection`)
 2. serialize conversation to text
@@ -83,7 +83,6 @@ On `turn_end` (when enabled and `autoAfterTurn`):
    - summary
    - learnings
    - antiPatterns
-   - nextTurnAdvice
 4. append markdown entry to `daily/YYYY-MM-DD.md`
 5. update durable memory:
    - `core/index.json` (scored records)
@@ -138,14 +137,11 @@ Keep this flow intact when editing; it is how historical memory influences futur
 
 Reflection model selection order:
 
-1. runtime branch override (`/learning-model`)
-2. merged config model (`selfLearning.model`)
-3. fallback `google/gemini-2.5-flash`
-4. fallback `openai/gpt-5-mini`
-5. fallback current `ctx.model`
+1. merged config model (`selfLearning.model`)
+2. fallback current `ctx.model`
 
 The extension only uses a candidate if an API key is available from `ctx.modelRegistry`.
-
+If the configured model is missing/invalid, diagnostics include the reason and available model list.
 ## Key extension commands
 
 Implemented in `self-learning.ts`:
@@ -153,6 +149,7 @@ Implemented in `self-learning.ts`:
 - `/learning-now`
 - `/learning-month [YYYY-MM]`
 - `/learning-toggle`
+- `/learning-model` (interactive selector)
 - `/learning-model <provider/id> | reset`
 - `/learning-model-global <provider/id> | reset | show`
 - `/learning-daily`

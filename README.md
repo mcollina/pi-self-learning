@@ -2,7 +2,7 @@
 
 A [pi](https://github.com/mariozechner/pi) extension that keeps a **git-backed memory** of each session:
 
-- automatic turn reflections
+- automatic task-level reflections
 - daily logs
 - monthly summaries
 - a durable **core learnings** file
@@ -10,9 +10,9 @@ A [pi](https://github.com/mariozechner/pi) extension that keeps a **git-backed m
 
 ## What it does
 
-After each turn (when enabled), it:
+After each completed agent task (when enabled), it:
 1. summarizes what happened,
-2. extracts learnings, anti-patterns, and next-turn advice,
+2. extracts learnings and anti-patterns,
 3. appends the entry to a daily markdown file,
 4. updates `core/CORE.md` with important durable learnings,
 5. maintains a scored `core/index.json` (frequency + recency),
@@ -71,7 +71,7 @@ Project `.pi/settings.json`:
 {
   "selfLearning": {
     "enabled": true,
-    "autoAfterTurn": true,
+    "autoAfterTask": true,
     "injectLastN": 5,
     "maxMessagesForReflection": 8,
     "maxLearnings": 8,
@@ -104,6 +104,9 @@ Project `.pi/settings.json`:
 `selfLearning.model` can be set in:
 - global `~/.pi/agent/settings.json` (global default)
 - project `.pi/settings.json` (project override)
+
+`selfLearning.autoAfterTask` controls automatic reflection after each completed agent task.
+Legacy `selfLearning.autoAfterTurn` is still accepted for backward compatibility.
 
 ## Loading memory into context
 

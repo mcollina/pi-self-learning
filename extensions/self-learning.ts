@@ -22,7 +22,8 @@ type ModelRef = {
 
 type SelfLearningConfig = {
   enabled: boolean;
-  autoAfterTurn: boolean;
+  autoAfterTask: boolean;
+  autoAfterTurn?: boolean; // deprecated; kept for backward compatibility
   injectLastN: number;
   maxMessagesForReflection: number;
   maxLearnings: number;
@@ -56,7 +57,6 @@ type LearningReflection = {
   summary: string;
   learnings: string[];
   antiPatterns: string[];
-  nextTurnAdvice: string[];
 };
 
 type ReflectionSkipReason =
@@ -85,7 +85,7 @@ type SessionEntry = {
 
 const DEFAULT_CONFIG: SelfLearningConfig = {
   enabled: true,
-  autoAfterTurn: true,
+  autoAfterTask: true,
   injectLastN: 5,
   maxMessagesForReflection: 8,
   maxLearnings: 8,
@@ -295,7 +295,6 @@ function parseReflection(raw: string): LearningReflection | undefined {
       summary: summary || "No summary",
       learnings: list(parsed.learnings),
       antiPatterns: list(parsed.antiPatterns),
-      nextTurnAdvice: list(parsed.nextTurnAdvice),
     };
   } catch {
     return undefined;
@@ -360,7 +359,7 @@ function buildReflectionRepairPrompt(rawModelOutput: string): string {
   return [
     "Convert the following model output into STRICT JSON only.",
     "Return exactly one JSON object with this schema:",
-    '{"summary":"string","learnings":["..."],"antiPatterns":["..."],"nextTurnAdvice":["..."]}',
+    '{"summary":"string","learnings":["..."],"antiPatterns":["..."]}',
     "Do not add markdown fences. Do not add commentary.",
     "If information is missing, use empty arrays and a short summary.",
     "",
@@ -401,7 +400,7 @@ function buildReflectionPrompt(conversationText: string, maxLearnings: number): 
     "You are a coding session reflection engine.",
     "Summarize what happened and extract learnings.",
     "Return STRICT JSON only with this schema:",
-    '{"summary":"string","learnings":["..."],"antiPatterns":["..."],"nextTurnAdvice":["..."]}',
+    '{"summary":"string","learnings":["..."],"antiPatterns":["..."]}',
     "Rules:",
     "- Keep summary under 120 words.",
     `- Keep each array short (max ${maxLearnings}).`,
@@ -447,9 +446,6 @@ function buildMarkdownEntry(when: Date, turnLabel: string, reflection: LearningR
   for (const item of reflection.antiPatterns) lines.push(`- ${item}`);
   lines.push("");
 
-  lines.push("### Next-turn advice");
-  if (reflection.nextTurnAdvice.length === 0) lines.push("- (none)");
-  for (const item of reflection.nextTurnAdvice) lines.push(`- ${item}`);
   lines.push("", "");
 
   return lines.join("\n");
@@ -619,6 +615,12 @@ async function pickReflectionModel(config: SelfLearningConfig, ctx: ExtensionCon
 function isLearningEnabled(config: SelfLearningConfig, ctx: ExtensionContext): boolean {
   const runtimeEnabled = getRuntimeEnabledOverride(ctx);
   return runtimeEnabled ?? config.enabled;
+}
+
+function isAutoReflectionEnabled(config: SelfLearningConfig): boolean {
+  if (typeof config.autoAfterTask === "boolean") return config.autoAfterTask;
+  if (typeof config.autoAfterTurn === "boolean") return config.autoAfterTurn;
+  return true;
 }
 
 function ensureGitRepo(root: string, config: SelfLearningConfig): void {
@@ -1119,14 +1121,14 @@ async function generateMonthSummary(
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.on("turn_end", async (event, ctx) => {
+  pi.on("agent_end", async (_event, ctx) => {
     const settings = loadMergedSettings(ctx.cwd);
     const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
 
-    if (!isLearningEnabled(config, ctx) || !config.autoAfterTurn) return;
+    if (!isLearningEnabled(config, ctx) || !isAutoReflectionEnabled(config)) return;
 
     try {
-      const result = await reflectNow(`Turn ${event.turnIndex}`, ctx);
+      const result = await reflectNow("Task", ctx);
       if (result.file && ctx.hasUI) {
         ctx.ui.notify(`Self-learning saved: ${result.file}`, "info");
       }
@@ -1399,6 +1401,13 @@ export default function (pi: ExtensionAPI) {
       const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
       const runtimeEnabled = getRuntimeEnabledOverride(ctx);
       const enabled = runtimeEnabled ?? config.enabled;
+      const autoReflectionEnabled = isAutoReflectionEnabled(config);
+      const autoReflectionSource =
+        typeof config.autoAfterTask === "boolean"
+          ? "autoAfterTask"
+          : typeof config.autoAfterTurn === "boolean"
+            ? "autoAfterTurn (legacy)"
+            : "default";
       const root = resolveStorageRoot(config, ctx.cwd);
       const runtimeModel = getRuntimeModelOverride(ctx);
       const configModel = configuredModel(config);
@@ -1421,7 +1430,7 @@ export default function (pi: ExtensionAPI) {
       );
 
       ctx.ui.notify(`selfLearning.enabled=${enabled} (runtime override: ${runtimeEnabled ?? "none"})`, "info");
-      ctx.ui.notify(`selfLearning.autoAfterTurn=${config.autoAfterTurn}`, "info");
+      ctx.ui.notify(`selfLearning.autoAfterTask=${autoReflectionEnabled} (source: ${autoReflectionSource})`, "info");
       ctx.ui.notify(`selfLearning.storage.mode=${config.storage.mode}`, "info");
       ctx.ui.notify(`selfLearning.storage.root=${root}`, "info");
       ctx.ui.notify(`selfLearning.git.enabled=${config.git.enabled}`, "info");
