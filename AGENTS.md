@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents like Claude Code (claude.ai/code
 
 - This repo is a **single pi extension package** (`pi-self-learning`).
 - Runtime logic is concentrated in **`extensions/self-learning.ts`**.
-- The extension implements a reflection loop: summarize recent conversation after completed agent tasks, persist learnings to markdown/json files, optionally commit to a dedicated memory git repo, and inject memory back into future prompts.
+- The extension implements a reflection loop: analyze recent conversation after completed agent tasks for mistakes/fixes, persist learnings to markdown/json files, optionally commit to a dedicated memory git repo, and inject memory back into future prompts.
 
 ## Common commands in this repo
 
@@ -80,9 +80,8 @@ On `agent_end` (when enabled and `autoAfterTask`):
 1. collect recent branch messages (`maxMessagesForReflection`)
 2. serialize conversation to text
 3. run LLM reflection prompt expecting strict JSON:
-   - summary
-   - learnings
-   - antiPatterns
+   - mistakes
+   - fixes
 4. append markdown entry to `daily/YYYY-MM-DD.md`
 5. update durable memory:
    - `core/index.json` (scored records)

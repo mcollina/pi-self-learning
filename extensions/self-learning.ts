@@ -54,9 +54,8 @@ type SelfLearningConfig = {
 };
 
 type LearningReflection = {
-  summary: string;
-  learnings: string[];
-  antiPatterns: string[];
+  mistakes: string[];
+  fixes: string[];
 };
 
 type ReflectionSkipReason =
@@ -69,7 +68,6 @@ type ReflectionSkipReason =
 
 type ReflectNowResult = {
   file?: string;
-  summary?: string;
   reason?: ReflectionSkipReason;
   rawModelOutput?: string;
   repairModelOutput?: string;
@@ -285,16 +283,26 @@ function parseReflection(raw: string): LearningReflection | undefined {
     const parsed = JSON.parse(candidate) as unknown;
     if (!isPlainObject(parsed)) return undefined;
 
-    const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
     const list = (value: unknown): string[] =>
       Array.isArray(value)
         ? value.filter((v): v is string => typeof v === "string").map((v) => v.trim()).filter(Boolean)
         : [];
 
+    const mistakes = list(parsed.mistakes);
+    const fixes = list(parsed.fixes);
+
+    // Backward compatibility for older outputs
+    const fallbackMistakes = list(parsed.antiPatterns);
+    const fallbackFixes = list(parsed.learnings);
+
+    const normalizedMistakes = mistakes.length > 0 ? mistakes : fallbackMistakes;
+    const normalizedFixes = fixes.length > 0 ? fixes : fallbackFixes;
+
+    if (normalizedMistakes.length === 0 && normalizedFixes.length === 0) return undefined;
+
     return {
-      summary: summary || "No summary",
-      learnings: list(parsed.learnings),
-      antiPatterns: list(parsed.antiPatterns),
+      mistakes: normalizedMistakes,
+      fixes: normalizedFixes,
     };
   } catch {
     return undefined;
@@ -359,9 +367,9 @@ function buildReflectionRepairPrompt(rawModelOutput: string): string {
   return [
     "Convert the following model output into STRICT JSON only.",
     "Return exactly one JSON object with this schema:",
-    '{"summary":"string","learnings":["..."],"antiPatterns":["..."]}',
+    '{"mistakes":["..."],"fixes":["..."]}',
     "Do not add markdown fences. Do not add commentary.",
-    "If information is missing, use empty arrays and a short summary.",
+    "If information is missing, use empty arrays.",
     "",
     "<raw_output>",
     compactText(rawModelOutput, 6000),
@@ -397,14 +405,15 @@ function previewResponseContent(content: unknown, maxChars = 1200): string {
 
 function buildReflectionPrompt(conversationText: string, maxLearnings: number): string {
   return [
-    "You are a coding session reflection engine.",
-    "Summarize what happened and extract learnings.",
+    "You are a coding session mistake-prevention reflection engine.",
+    "Focus on what went wrong and how it was fixed.",
+    "Do NOT summarize accomplishments or completed tasks.",
     "Return STRICT JSON only with this schema:",
-    '{"summary":"string","learnings":["..."],"antiPatterns":["..."]}',
+    '{"mistakes":["..."],"fixes":["..."]}',
     "Rules:",
-    "- Keep summary under 120 words.",
     `- Keep each array short (max ${maxLearnings}).`,
-    "- Prefer specific, actionable points.",
+    "- Prefer specific, actionable, prevention-oriented points.",
+    "- Avoid generic statements and progress summaries.",
     "",
     "<conversation>",
     conversationText,
@@ -432,20 +441,15 @@ function buildMarkdownEntry(when: Date, turnLabel: string, reflection: LearningR
   const lines: string[] = [];
   lines.push(`## ${toTimeUTC(when)} — ${turnLabel}`);
   lines.push("");
-  lines.push("### Summary");
-  lines.push(reflection.summary || "No summary");
+
+  lines.push("### What went wrong");
+  if (reflection.mistakes.length === 0) lines.push("- (none)");
+  for (const item of reflection.mistakes) lines.push(`- ${item}`);
   lines.push("");
 
-  lines.push("### Learnings");
-  if (reflection.learnings.length === 0) lines.push("- (none)");
-  for (const item of reflection.learnings) lines.push(`- ${item}`);
-  lines.push("");
-
-  lines.push("### Anti-patterns");
-  if (reflection.antiPatterns.length === 0) lines.push("- (none)");
-  for (const item of reflection.antiPatterns) lines.push(`- ${item}`);
-  lines.push("");
-
+  lines.push("### How it was fixed");
+  if (reflection.fixes.length === 0) lines.push("- (none)");
+  for (const item of reflection.fixes) lines.push(`- ${item}`);
   lines.push("", "");
 
   return lines.join("\n");
@@ -802,8 +806,8 @@ function updateCoreFromReflection(root: string, reflection: LearningReflection, 
   const nowIso = new Date().toISOString();
 
   const updates: Array<{ text: string; kind: CoreKind }> = [
-    ...reflection.learnings.map((text) => ({ text, kind: "learning" as const })),
-    ...reflection.antiPatterns.map((text) => ({ text: `Avoid: ${text}`, kind: "antiPattern" as const })),
+    ...reflection.fixes.map((text) => ({ text, kind: "learning" as const })),
+    ...reflection.mistakes.map((text) => ({ text: `Avoid: ${text}`, kind: "antiPattern" as const })),
   ]
     .map((entry) => ({ text: normalizeLearningText(entry.text), kind: entry.kind }))
     .filter((entry) => entry.text.length > 0);
@@ -1059,11 +1063,13 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
 
   gitCommit(root, [dailyFile, ...coreFiles], `chore(memory): ${toDateKeyUTC(now)} ${turnLabel.toLowerCase()}`, config);
 
-  const shortSummary = parsed.summary.slice(0, 180);
-  RUNTIME_NOTES.push(shortSummary);
-  if (RUNTIME_NOTES.length > 30) RUNTIME_NOTES.splice(0, RUNTIME_NOTES.length - 30);
+  const shortNote = (parsed.mistakes[0] || parsed.fixes[0] || "").slice(0, 180);
+  if (shortNote) {
+    RUNTIME_NOTES.push(shortNote);
+    if (RUNTIME_NOTES.length > 30) RUNTIME_NOTES.splice(0, RUNTIME_NOTES.length - 30);
+  }
 
-  return { file: dailyFile, summary: parsed.summary };
+  return { file: dailyFile };
 }
 
 async function generateMonthSummary(
@@ -1128,12 +1134,15 @@ export default function (pi: ExtensionAPI) {
     if (!isLearningEnabled(config, ctx) || !isAutoReflectionEnabled(config)) return;
 
     try {
+      if (ctx.hasUI) ctx.ui.setWorkingMessage("learning");
       const result = await reflectNow("Task", ctx);
       if (result.file && ctx.hasUI) {
         ctx.ui.notify(`Self-learning saved: ${result.file}`, "info");
       }
     } catch {
       // Never break normal flow
+    } finally {
+      if (ctx.hasUI) ctx.ui.setWorkingMessage();
     }
   });
 
@@ -1176,6 +1185,7 @@ export default function (pi: ExtensionAPI) {
     description: "Run self-learning reflection now and append to daily file",
     handler: async (_args, ctx) => {
       try {
+        if (ctx.hasUI) ctx.ui.setWorkingMessage("learning");
         const result = await reflectNow("Manual", ctx);
         if (!result.file) {
           const detail = result.reason ? describeReflectionSkipReason(result.reason) : "unknown reason";
@@ -1203,6 +1213,8 @@ export default function (pi: ExtensionAPI) {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`learning-now failed: ${message}`, "error");
+      } finally {
+        if (ctx.hasUI) ctx.ui.setWorkingMessage();
       }
     },
   });
@@ -1217,6 +1229,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       try {
+        if (ctx.hasUI) ctx.ui.setWorkingMessage("learning");
         const result = await generateMonthSummary(month, ctx);
         if (!result.file) {
           if (result.dailyCount === 0) {
@@ -1230,6 +1243,8 @@ export default function (pi: ExtensionAPI) {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`learning-month failed: ${message}`, "error");
+      } finally {
+        if (ctx.hasUI) ctx.ui.setWorkingMessage();
       }
     },
   });

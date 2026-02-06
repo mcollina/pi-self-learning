@@ -11,12 +11,11 @@ A [pi](https://github.com/mariozechner/pi) extension that keeps a **git-backed m
 ## What it does
 
 After each completed agent task (when enabled), it:
-1. summarizes what happened,
-2. extracts learnings and anti-patterns,
-3. appends the entry to a daily markdown file,
-4. updates `core/CORE.md` with important durable learnings,
-5. maintains a scored `core/index.json` (frequency + recency),
-6. commits changes in a dedicated memory git repository.
+1. extracts what went wrong and how it was fixed,
+2. appends the entry to a daily markdown file,
+3. updates `core/CORE.md` with important durable learnings,
+4. maintains a scored `core/index.json` (frequency + recency),
+5. commits changes in a dedicated memory git repository.
 
 ## Memory folder layout
 
