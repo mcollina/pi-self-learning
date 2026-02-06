@@ -85,7 +85,8 @@ On `agent_end` (when enabled and `autoAfterTask`):
 4. append markdown entry to `daily/YYYY-MM-DD.md`
 5. update durable memory:
    - `core/index.json` (scored records)
-   - `core/CORE.md` (ranked render)
+   - `core/CORE.md` (top-ranked render)
+   - `long-term-memory.md` (complete learnings history)
 6. optionally auto-commit changes in memory repo
 
 Reflection failures are intentionally non-blocking.
@@ -101,7 +102,8 @@ Expected layout:
 
 - `daily/` turn-level journal entries
 - `monthly/` generated month summaries
-- `core/CORE.md` human-readable durable learnings
+- `core/CORE.md` top-ranked durable learnings
+- `long-term-memory.md` complete learnings history
 - `core/index.json` canonical scored index
 
 If git is enabled, the extension initializes a repo in the memory root and commits updates.
@@ -160,4 +162,4 @@ When adding or changing behavior, update command descriptions and `README.md` in
 
 - Keep timestamps/date partitioning in UTC (`toDateKeyUTC`, `toMonthKeyUTC`, `toTimeUTC`) unless migrating all readers/writers.
 - Preserve non-blocking behavior in turn hooks; extension should not break normal agent flow.
-- If you change memory file formats (`daily`, `monthly`, `core/index.json`), include migration/backward-compat handling in code.
+- If you change memory file formats (`daily`, `monthly`, `core/index.json`, `long-term-memory.md`), include migration/backward-compat handling in code.

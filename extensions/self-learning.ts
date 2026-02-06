@@ -87,7 +87,7 @@ const DEFAULT_CONFIG: SelfLearningConfig = {
   injectLastN: 5,
   maxMessagesForReflection: 8,
   maxLearnings: 8,
-  maxCoreItems: 150,
+  maxCoreItems: 20,
   storage: {
     mode: "project",
     projectPath: ".pi/self-learning-memory",
@@ -235,6 +235,10 @@ function coreDir(root: string): string {
 
 function coreFile(root: string): string {
   return join(coreDir(root), "CORE.md");
+}
+
+function longTermMemoryFile(root: string): string {
+  return join(root, "long-term-memory.md");
 }
 
 function appendDailyEntry(root: string, when: Date, content: string): string {
@@ -639,10 +643,20 @@ function ensureGitRepo(root: string, config: SelfLearningConfig): void {
   if (!existsSync(readme)) {
     writeFileSync(
       readme,
-      "# Self-learning memory\n\nThis folder is auto-managed by pi-self-learning.\n\n- daily/: day-by-day reflections\n- monthly/: monthly summaries\n- core/CORE.md: durable learnings\n",
+      "# Self-learning memory\n\nThis folder is auto-managed by pi-self-learning.\n\n- daily/: day-by-day reflections\n- monthly/: monthly summaries\n- core/CORE.md: top-ranked durable learnings\n- long-term-memory.md: complete learning history\n",
       "utf-8",
     );
   }
+
+  const longTerm = longTermMemoryFile(root);
+  if (!existsSync(longTerm)) {
+    writeFileSync(
+      longTerm,
+      "# Long-term Memory\n\nComplete history of durable learnings and recurring mistakes.\n\n## All learnings\n- (none yet)\n\n## All watch-outs\n- (none yet)\n",
+      "utf-8",
+    );
+  }
+
   spawnSync("git", ["-C", root, "add", "."], { encoding: "utf-8" });
   spawnSync("git", ["-C", root, "commit", "-m", "chore(memory): initialize memory repository"], {
     encoding: "utf-8",
@@ -765,15 +779,17 @@ function effectiveScore(item: CoreIndexRecord): number {
   return item.score + kindBoost - recencyPenalty;
 }
 
+function sortedIndexItems(index: CoreIndex): CoreIndexRecord[] {
+  return [...index.items].sort((a, b) => {
+    const scoreDelta = effectiveScore(b) - effectiveScore(a);
+    if (Math.abs(scoreDelta) > 0.0001) return scoreDelta;
+    if (b.hits !== a.hits) return b.hits - a.hits;
+    return Date.parse(b.lastSeen) - Date.parse(a.lastSeen);
+  });
+}
+
 function renderCoreFromIndex(root: string, index: CoreIndex, maxItems: number): string {
-  const sorted = [...index.items]
-    .sort((a, b) => {
-      const scoreDelta = effectiveScore(b) - effectiveScore(a);
-      if (Math.abs(scoreDelta) > 0.0001) return scoreDelta;
-      if (b.hits !== a.hits) return b.hits - a.hits;
-      return Date.parse(b.lastSeen) - Date.parse(a.lastSeen);
-    })
-    .slice(0, Math.max(1, maxItems));
+  const sorted = sortedIndexItems(index).slice(0, Math.max(1, maxItems));
 
   const learnings = sorted.filter((x) => x.kind === "learning");
   const antiPatterns = sorted.filter((x) => x.kind === "antiPattern");
@@ -783,6 +799,9 @@ function renderCoreFromIndex(root: string, index: CoreIndex, maxItems: number): 
     "",
     "Most important durable learnings collected over time.",
     `Last updated: ${new Date().toISOString()}`,
+    "",
+    "This file keeps only top-ranked, most repeated items.",
+    "For the complete history, see long-term-memory.md.",
     "",
     "Ranked by frequency + recency (with light decay over time).",
     "",
@@ -797,6 +816,32 @@ function renderCoreFromIndex(root: string, index: CoreIndex, maxItems: number): 
   ].join("\n");
 
   const file = ensureCoreFile(root);
+  writeFileSync(file, content, "utf-8");
+  return file;
+}
+
+function renderLongTermMemoryFromIndex(root: string, index: CoreIndex): string {
+  const sorted = sortedIndexItems(index);
+  const learnings = sorted.filter((x) => x.kind === "learning");
+  const antiPatterns = sorted.filter((x) => x.kind === "antiPattern");
+
+  const content = [
+    "# Long-term Memory",
+    "",
+    "Complete history of durable learnings and recurring mistakes.",
+    `Last updated: ${new Date().toISOString()}`,
+    "",
+    "## All learnings",
+    ...(learnings.length > 0 ? learnings.map((item) => `- ${item.text}`) : ["- (none yet)"]),
+    "",
+    "## All watch-outs",
+    ...(antiPatterns.length > 0
+      ? antiPatterns.map((item) => `- ${item.text.replace(/^avoid:\s*/i, "")}`)
+      : ["- (none yet)"]),
+    "",
+  ].join("\n");
+
+  const file = longTermMemoryFile(root);
   writeFileSync(file, content, "utf-8");
   return file;
 }
@@ -844,9 +889,10 @@ function updateCoreFromReflection(root: string, reflection: LearningReflection, 
   index.updatedAt = nowIso;
   index.items = [...byKey.values()];
 
-  const renderedCore = renderCoreFromIndex(root, index, Math.max(10, maxItems));
+  const renderedCore = renderCoreFromIndex(root, index, Math.max(1, maxItems));
+  const longTermFile = renderLongTermMemoryFromIndex(root, index);
   const indexFile = saveCoreIndex(root, index);
-  return [renderedCore, indexFile];
+  return [renderedCore, longTermFile, indexFile];
 }
 
 function collectMonthDailyFiles(root: string, month: string): string[] {
@@ -941,6 +987,7 @@ function buildMemoryInstruction(config: SelfLearningConfig): string {
     "2) For historical questions, check daily/*.md then monthly/*.md.",
     "3) Prefer evidence from memory files over guessing.",
     "4) If evidence is missing, explicitly state that and suggest searching memory logs.",
+    "5) If you are stuck and need help, consult long-term-memory.md for broader prior fixes and mistakes.",
   ].join("\n");
 }
 
@@ -1059,7 +1106,7 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
   ensureGitRepo(root, config);
 
   const dailyFile = appendDailyEntry(root, now, entry);
-  const coreFiles = updateCoreFromReflection(root, parsed, Math.max(10, config.maxCoreItems || 150));
+  const coreFiles = updateCoreFromReflection(root, parsed, Math.max(1, config.maxCoreItems || 20));
 
   gitCommit(root, [dailyFile, ...coreFiles], `chore(memory): ${toDateKeyUTC(now)} ${turnLabel.toLowerCase()}`, config);
 

@@ -13,9 +13,10 @@ A [pi](https://github.com/mariozechner/pi) extension that keeps a **git-backed m
 After each completed agent task (when enabled), it:
 1. extracts what went wrong and how it was fixed,
 2. appends the entry to a daily markdown file,
-3. updates `core/CORE.md` with important durable learnings,
-4. maintains a scored `core/index.json` (frequency + recency),
-5. commits changes in a dedicated memory git repository.
+3. updates `core/CORE.md` with top-ranked durable learnings,
+4. writes full history to `long-term-memory.md`,
+5. maintains a scored `core/index.json` (frequency + recency),
+6. commits changes in a dedicated memory git repository.
 
 ## Memory folder layout
 
@@ -29,6 +30,7 @@ Default project path: `.pi/self-learning-memory`
 │   └── YYYY-MM-DD.md
 ├── monthly/
 │   └── YYYY-MM.md
+├── long-term-memory.md
 └── core/
     ├── CORE.md
     └── index.json
@@ -74,7 +76,7 @@ Project `.pi/settings.json`:
     "injectLastN": 5,
     "maxMessagesForReflection": 8,
     "maxLearnings": 8,
-    "maxCoreItems": 150,
+    "maxCoreItems": 20,
     "storage": {
       "mode": "project",
       "projectPath": ".pi/self-learning-memory",
@@ -122,7 +124,8 @@ Use `selfLearning.context` to inject memory into each turn:
 With `instructionMode: "strict"`, the extension appends policy telling the assistant to:
 1. consult `core/CORE.md` first,
 2. check `daily/*.md` then `monthly/*.md` for historical questions,
-3. prefer evidence over guessing.
+3. prefer evidence over guessing,
+4. if stuck, consult `long-term-memory.md` for broader prior fixes and mistakes.
 
 ## Commands
 

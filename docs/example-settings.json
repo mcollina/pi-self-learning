@@ -5,7 +5,7 @@
     "injectLastN": 5,
     "maxMessagesForReflection": 8,
     "maxLearnings": 8,
-    "maxCoreItems": 150,
+    "maxCoreItems": 20,
     "storage": {
       "mode": "project",
       "projectPath": ".pi/self-learning-memory",
