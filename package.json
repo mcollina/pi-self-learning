@@ -1,0 +1,21 @@
+{
+  "name": "pi-self-learning",
+  "version": "0.1.0",
+  "description": "Pi extension for daily self-learning memory with monthly summaries and git-backed commits",
+  "type": "module",
+  "main": "./extensions/self-learning.ts",
+  "pi": {
+    "extensions": [
+      "./extensions/self-learning.ts"
+    ]
+  },
+  "files": [
+    "extensions/",
+    "docs/",
+    "README.md"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.50.0"
+  }
+}

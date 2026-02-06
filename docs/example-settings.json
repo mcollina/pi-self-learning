@@ -1,0 +1,22 @@
+{
+  "selfLearning": {
+    "enabled": true,
+    "autoAfterTurn": true,
+    "injectLastN": 5,
+    "maxMessagesForReflection": 8,
+    "maxLearnings": 8,
+    "storage": {
+      "mode": "project",
+      "projectPath": ".pi/self-learning-memory",
+      "globalPath": "~/.pi/agent/self-learning-memory"
+    },
+    "git": {
+      "enabled": true,
+      "autoCommit": true
+    },
+    "model": {
+      "provider": "google",
+      "id": "gemini-2.5-flash"
+    }
+  }
+}
