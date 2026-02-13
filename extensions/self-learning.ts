@@ -775,8 +775,7 @@ function effectiveScore(item: CoreIndexRecord): number {
   const ageMs = Date.now() - Date.parse(item.lastSeen);
   const ageDays = Number.isFinite(ageMs) && ageMs > 0 ? ageMs / (1000 * 60 * 60 * 24) : 0;
   const recencyPenalty = ageDays * 0.05;
-  const kindBoost = item.kind === "antiPattern" ? 0.2 : 0;
-  return item.score + kindBoost - recencyPenalty;
+  return item.score - recencyPenalty;
 }
 
 function sortedIndexItems(index: CoreIndex): CoreIndexRecord[] {
@@ -788,11 +787,33 @@ function sortedIndexItems(index: CoreIndex): CoreIndexRecord[] {
   });
 }
 
-function renderCoreFromIndex(root: string, index: CoreIndex, maxItems: number): string {
-  const sorted = sortedIndexItems(index).slice(0, Math.max(1, maxItems));
-
+function selectBalancedCoreItems(index: CoreIndex, maxItems: number): CoreIndexRecord[] {
+  const limit = Math.max(1, maxItems);
+  const sorted = sortedIndexItems(index);
   const learnings = sorted.filter((x) => x.kind === "learning");
   const antiPatterns = sorted.filter((x) => x.kind === "antiPattern");
+
+  if (learnings.length === 0 || antiPatterns.length === 0) {
+    return sorted.slice(0, limit);
+  }
+
+  const basePerKind = Math.max(1, Math.floor(limit / 2));
+  const pickedLearnings = learnings.slice(0, basePerKind);
+  const pickedAntiPatterns = antiPatterns.slice(0, basePerKind);
+
+  const picked = [...pickedLearnings, ...pickedAntiPatterns];
+  if (picked.length >= limit) return picked.slice(0, limit);
+
+  const used = new Set(picked.map((item) => item.key));
+  const remainder = sorted.filter((item) => !used.has(item.key));
+  const needed = limit - picked.length;
+  return [...picked, ...remainder.slice(0, needed)];
+}
+
+function renderCoreFromIndex(root: string, index: CoreIndex, maxItems: number): string {
+  const selected = selectBalancedCoreItems(index, maxItems);
+  const learnings = selected.filter((x) => x.kind === "learning");
+  const antiPatterns = selected.filter((x) => x.kind === "antiPattern");
 
   const content = [
     "# Core Learnings",
@@ -869,7 +890,7 @@ function updateCoreFromReflection(root: string, reflection: LearningReflection, 
         text: entry.text,
         kind: entry.kind,
         hits: 1,
-        score: entry.kind === "antiPattern" ? 1.2 : 1,
+        score: 1,
         firstSeen: nowIso,
         lastSeen: nowIso,
       });
@@ -881,7 +902,7 @@ function updateCoreFromReflection(root: string, reflection: LearningReflection, 
     existing.hits += 1;
     existing.lastSeen = nowIso;
 
-    const incrementBase = entry.kind === "antiPattern" ? 1.2 : 1;
+    const incrementBase = 1;
     const repetitionBonus = Math.min(1, existing.hits * 0.08);
     existing.score += incrementBase + repetitionBonus;
   }

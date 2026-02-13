@@ -120,7 +120,7 @@ Ranking favors:
 
 - higher score/hits
 - recency (with light time decay)
-- slight anti-pattern boost
+- balanced representation in `CORE.md` (learnings + watch-outs each get reserved slots when both exist)
 
 `CORE.md` is rendered from this ranked index (do not treat `CORE.md` as the only source of truth).
 
