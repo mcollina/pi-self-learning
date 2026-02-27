@@ -1,6 +1,6 @@
 {
   "name": "pi-self-learning",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension for daily self-learning memory with monthly summaries and git-backed commits",
   "type": "module",
   "main": "./extensions/self-learning.ts",
