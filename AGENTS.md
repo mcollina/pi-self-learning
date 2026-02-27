@@ -45,6 +45,7 @@ Place that in project `.pi/settings.json`.
   - `/learning-now`
   - `/learning-status`
   - `/learning-month [YYYY-MM]`
+  - `/learning-redistill [limit] [--dry-run] [--yes]` (when validating global-memory migration behavior)
 
 ## Quick start checklist (for AI agents)
 
@@ -82,6 +83,9 @@ On `agent_end` (when enabled and `autoAfterTask`):
 3. run LLM reflection prompt expecting strict JSON:
    - mistakes
    - fixes
+   - scope-aware wording:
+     - `storage.mode=project`: keep project-specific detail when useful
+     - `storage.mode=global`: distill to cross-project reusable actions (avoid repo-specific identifiers)
 4. append markdown entry to `daily/YYYY-MM-DD.md`
 5. update durable memory:
    - `core/index.json` (scored records)
@@ -143,12 +147,17 @@ Reflection model selection order:
 
 The extension only uses a candidate if an API key is available from `ctx.modelRegistry`.
 If the configured model is missing/invalid, diagnostics include the reason and available model list.
+
+Redistill model resolution:
+
+- `/learning-redistill` requires an explicit configured model (`selfLearning.model`) and does not use the current session model fallback.
 ## Key extension commands
 
 Implemented in `self-learning.ts`:
 
 - `/learning-now`
 - `/learning-month [YYYY-MM]`
+- `/learning-redistill [limit] [--dry-run] [--yes]`
 - `/learning-toggle`
 - `/learning-model` (interactive selector)
 - `/learning-model <provider/id> | reset`

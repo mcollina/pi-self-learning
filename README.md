@@ -109,6 +109,16 @@ Project `.pi/settings.json`:
 `selfLearning.autoAfterTask` controls automatic reflection after each completed agent task.
 Legacy `selfLearning.autoAfterTurn` is still accepted for backward compatibility.
 
+Prompt scope depends on storage mode:
+- `storage.mode: "project"` keeps repository-specific details when they are useful.
+- `storage.mode: "global"` distills reflections into cross-project, reusable action rules and avoids project-specific identifiers.
+
+If you already have legacy global entries with project-specific wording, run:
+- `/learning-redistill` to rewrite all existing core index entries
+- `/learning-redistill 300 --dry-run` to preview impact on a subset without writing files
+
+`/learning-redistill` uses the configured `selfLearning.model` (not the current session model). Set it via `.pi/settings.json` or `/learning-model-global`.
+
 ## Loading memory into context
 
 Use `selfLearning.context` to inject memory into each turn:
@@ -131,6 +141,7 @@ With `instructionMode: "strict"`, the extension appends policy telling the assis
 
 - `/learning-now` → generate reflection now
 - `/learning-month [YYYY-MM]` → generate monthly summary
+- `/learning-redistill [limit] [--dry-run] [--yes]` → re-distill existing core memory into cross-project rules (global mode)
 - `/learning-daily` → show today’s daily file path
 - `/learning-toggle` → enable/disable for current branch
 - `/learning-model` → open model selector (available models)

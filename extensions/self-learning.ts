@@ -110,6 +110,18 @@ const DEFAULT_CONFIG: SelfLearningConfig = {
 const TOGGLE_ENTRY = "self-learning:toggle";
 const MODEL_ENTRY = "self-learning:model";
 const RUNTIME_NOTES: string[] = [];
+const REDISTILL_CHUNK_SIZE = 8;
+const REDISTILL_MODEL_TIMEOUT_MS = 45_000;
+const REDISTILL_REPAIR_TIMEOUT_MS = 30_000;
+const REDISTILL_MODEL_MAX_TOKENS = 3200;
+const REDISTILL_REPAIR_MAX_TOKENS = 2400;
+const REFLECTION_MODEL_TIMEOUT_MS = 90_000;
+const REFLECTION_REPAIR_TIMEOUT_MS = 60_000;
+const MONTH_SUMMARY_MODEL_TIMEOUT_MS = 120_000;
+const GIT_FAST_TIMEOUT_MS = 15_000;
+const GIT_COMMIT_TIMEOUT_MS = 30_000;
+const REDISTILL_SKIP_AUTO_REFLECTION_MS = 5 * 60_000;
+let skipAutoReflectionUntil = 0;
 
 function isPlainObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -407,7 +419,21 @@ function previewResponseContent(content: unknown, maxChars = 1200): string {
   return compactText(rendered, maxChars);
 }
 
-function buildReflectionPrompt(conversationText: string, maxLearnings: number): string {
+function buildReflectionPrompt(
+  conversationText: string,
+  maxLearnings: number,
+  storageMode: SelfLearningConfig["storage"]["mode"],
+): string {
+  const scopeRules =
+    storageMode === "global"
+      ? [
+          "- Distill each item into a cross-project rule that is reusable in any repository.",
+          "- Remove project-specific details (file names, module names, internal identifiers, phase labels, ticket references).",
+          "- Rewrite specifics into generic actions while preserving the underlying lesson.",
+          "- Prefer imperative wording (e.g., 'Validate X before Y').",
+        ]
+      : ["- Keep concrete details that are useful for this specific project/repository."];
+
   return [
     "You are a coding session mistake-prevention reflection engine.",
     "Focus on what went wrong and how it was fixed.",
@@ -418,10 +444,85 @@ function buildReflectionPrompt(conversationText: string, maxLearnings: number): 
     `- Keep each array short (max ${maxLearnings}).`,
     "- Prefer specific, actionable, prevention-oriented points.",
     "- Avoid generic statements and progress summaries.",
+    ...scopeRules,
     "",
     "<conversation>",
     conversationText,
     "</conversation>",
+  ].join("\n");
+}
+
+function buildRedistillPrompt(items: Array<{ id: number; kind: "learning" | "antiPattern"; text: string }>): string {
+  return [
+    "Rewrite the memory entries into concise, cross-project action rules.",
+    "Return STRICT JSON only.",
+    "Schema:",
+    '{"items":[{"id":1,"text":"..."}]}',
+    "Rules:",
+    "- Return exactly one output item for each input id.",
+    "- Preserve each item's original meaning and prevention intent.",
+    "- Remove project/repo-specific identifiers (file names, paths, class/function names, symbol names, phase labels, ticket IDs).",
+    "- Rewrite into generic actions that are reusable across repositories.",
+    "- Keep each output as one concise sentence in imperative style.",
+    "- For antiPattern items, output MUST start with 'Avoid:'.",
+    "- For learning items, output MUST NOT start with 'Avoid:'.",
+    "",
+    "<items>",
+    JSON.stringify(items),
+    "</items>",
+  ].join("\n");
+}
+
+function parseRedistillOutput(raw: string): Map<number, string> | undefined {
+  const parse = (input: string): Map<number, string> | undefined => {
+    try {
+      const parsed = JSON.parse(stripCodeFence(input)) as unknown;
+      if (!isPlainObject(parsed) || !Array.isArray(parsed.items)) return undefined;
+
+      const out = new Map<number, string>();
+      for (const item of parsed.items) {
+        if (!isPlainObject(item)) continue;
+        const id = Number(item.id);
+        const text = typeof item.text === "string" ? item.text.trim() : "";
+        if (!Number.isFinite(id) || !text) continue;
+        out.set(id, text);
+      }
+
+      return out.size > 0 ? out : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const direct = parse(raw);
+  if (direct) return direct;
+
+  const extracted = extractFirstJsonObject(raw);
+  if (!extracted) return undefined;
+  return parse(extracted);
+}
+
+function buildRedistillRepairPrompt(
+  rawModelOutput: string,
+  items: Array<{ id: number; kind: "learning" | "antiPattern"; text: string }>,
+): string {
+  return [
+    "Convert the following model output into STRICT JSON only.",
+    "Return exactly one JSON object with this schema:",
+    '{"items":[{"id":1,"text":"..."}]}',
+    "Requirements:",
+    "- Keep exactly one output item per input id.",
+    "- For antiPattern items, text MUST start with 'Avoid:'.",
+    "- For learning items, text MUST NOT start with 'Avoid:'.",
+    "- No markdown fences. No commentary.",
+    "",
+    "<input_items>",
+    JSON.stringify(items),
+    "</input_items>",
+    "",
+    "<raw_output>",
+    compactText(rawModelOutput, 6000),
+    "</raw_output>",
   ].join("\n");
 }
 
@@ -432,7 +533,6 @@ function buildMonthPrompt(month: string, monthText: string): string {
     "- Wins",
     "- Recurring issues",
     "- Most important learnings",
-    "- Next-month focus",
     "Keep it concise and actionable.",
     "",
     "<month_journal>",
@@ -620,6 +720,75 @@ async function pickReflectionModel(config: SelfLearningConfig, ctx: ExtensionCon
   return { diagnostics };
 }
 
+type RedistillModelCandidate = {
+  model: NonNullable<ReturnType<typeof getModel>>;
+  apiKey: string;
+  source: "configured";
+};
+
+function modelRef(model: { provider: string; id: string }): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function redistillTimeoutMs(_model: { provider: string }, repair = false): number {
+  return repair ? REDISTILL_REPAIR_TIMEOUT_MS : REDISTILL_MODEL_TIMEOUT_MS;
+}
+
+async function buildRedistillModelCandidates(config: SelfLearningConfig, ctx: ExtensionContext): Promise<{
+  candidates: RedistillModelCandidate[];
+  diagnostics: string[];
+}> {
+  const diagnostics: string[] = [];
+  const candidates: RedistillModelCandidate[] = [];
+
+  const configured = configuredModel(config);
+  if (!configured) {
+    diagnostics.push("configured.model=(none)");
+    diagnostics.push("redistill requires an explicit selfLearning.model (provider/id)");
+    return { candidates, diagnostics };
+  }
+
+  diagnostics.push(`configured.model=${configured.provider}/${configured.id}`);
+
+  const registry = ctx.modelRegistry as unknown as {
+    find?: (provider: string, id: string) => NonNullable<ReturnType<typeof getModel>> | undefined;
+    getAvailable?: () => Promise<Array<{ provider?: string; id?: string }>>;
+  };
+
+  const model = registry.find?.(configured.provider, configured.id) ?? getModel(configured.provider, configured.id);
+  if (!model) {
+    diagnostics.push(`configured.model_not_found=${configured.provider}/${configured.id}`);
+
+    try {
+      const available = (await registry.getAvailable?.()) ?? [];
+      const valid = available
+        .filter((m) => typeof m?.provider === "string" && typeof m?.id === "string")
+        .map((m) => `${m.provider}/${m.id}`)
+        .sort();
+      diagnostics.push(`valid_models=${valid.length > 0 ? valid.slice(0, 40).join(", ") : "(none)"}`);
+    } catch {
+      diagnostics.push("valid_models=(unavailable from model registry)");
+    }
+
+    return { candidates, diagnostics };
+  }
+
+  const apiKey = await ctx.modelRegistry.getApiKey(model);
+  if (!apiKey) {
+    diagnostics.push(`configured.model_api_key_missing=${configured.provider}/${configured.id}`);
+    return { candidates, diagnostics };
+  }
+
+  candidates.push({
+    model,
+    apiKey,
+    source: "configured",
+  });
+
+  diagnostics.push(`redistill_candidates=configured:${modelRef(model)}`);
+  return { candidates, diagnostics };
+}
+
 function isLearningEnabled(config: SelfLearningConfig, ctx: ExtensionContext): boolean {
   const runtimeEnabled = getRuntimeEnabledOverride(ctx);
   return runtimeEnabled ?? config.enabled;
@@ -631,6 +800,30 @@ function isAutoReflectionEnabled(config: SelfLearningConfig): boolean {
   return true;
 }
 
+function runGit(root: string, args: string[], timeoutMs: number): { ok: boolean; stdout: string; stderr: string } {
+  const result = spawnSync("git", ["-C", root, ...args], {
+    encoding: "utf-8",
+    timeout: timeoutMs,
+  });
+
+  const stdout = result.stdout || "";
+  const stderr = result.stderr || "";
+
+  if (result.error) {
+    return {
+      ok: false,
+      stdout,
+      stderr: `${stderr}\n${result.error.message}`.trim(),
+    };
+  }
+
+  if (typeof result.status === "number" && result.status !== 0) {
+    return { ok: false, stdout, stderr };
+  }
+
+  return { ok: true, stdout, stderr };
+}
+
 function ensureGitRepo(root: string, config: SelfLearningConfig): void {
   if (!config.git.enabled) return;
 
@@ -638,7 +831,7 @@ function ensureGitRepo(root: string, config: SelfLearningConfig): void {
   const gitDir = join(root, ".git");
   if (existsSync(gitDir)) return;
 
-  spawnSync("git", ["-C", root, "init"], { encoding: "utf-8" });
+  runGit(root, ["init"], GIT_FAST_TIMEOUT_MS);
   const readme = join(root, "README.md");
   if (!existsSync(readme)) {
     writeFileSync(
@@ -657,10 +850,8 @@ function ensureGitRepo(root: string, config: SelfLearningConfig): void {
     );
   }
 
-  spawnSync("git", ["-C", root, "add", "."], { encoding: "utf-8" });
-  spawnSync("git", ["-C", root, "commit", "-m", "chore(memory): initialize memory repository"], {
-    encoding: "utf-8",
-  });
+  runGit(root, ["add", "."], GIT_FAST_TIMEOUT_MS);
+  runGit(root, ["commit", "-m", "chore(memory): initialize memory repository"], GIT_COMMIT_TIMEOUT_MS);
 }
 
 function gitCommit(root: string, files: string[], message: string, config: SelfLearningConfig): void {
@@ -669,11 +860,13 @@ function gitCommit(root: string, files: string[], message: string, config: SelfL
   const rel = files.map((file) => relative(root, file)).filter((p) => p && !p.startsWith(".."));
   if (rel.length === 0) return;
 
-  spawnSync("git", ["-C", root, "add", ...rel], { encoding: "utf-8" });
-  const status = spawnSync("git", ["-C", root, "status", "--porcelain"], { encoding: "utf-8" });
-  if (!status.stdout?.trim()) return;
+  const add = runGit(root, ["add", ...rel], GIT_FAST_TIMEOUT_MS);
+  if (!add.ok) return;
 
-  spawnSync("git", ["-C", root, "commit", "-m", message], { encoding: "utf-8" });
+  const status = runGit(root, ["status", "--porcelain"], GIT_FAST_TIMEOUT_MS);
+  if (!status.ok || !status.stdout.trim()) return;
+
+  runGit(root, ["commit", "-m", message], GIT_COMMIT_TIMEOUT_MS);
 }
 
 type CoreKind = "learning" | "antiPattern";
@@ -692,6 +885,29 @@ type CoreIndex = {
   version: 1;
   updatedAt: string;
   items: CoreIndexRecord[];
+};
+
+type RedistillCoreResult = {
+  before: number;
+  after: number;
+  processed: number;
+  changed: number;
+  deduped: number;
+  totalChunks: number;
+  modelUsage: Array<{ model: string; chunks: number }>;
+  files?: string[];
+  model: string;
+  diagnostics: string[];
+  samples: Array<{ kind: CoreKind; before: string; after: string }>;
+};
+
+type RedistillProgress = {
+  currentChunk: number;
+  totalChunks: number;
+  processed: number;
+  totalItems: number;
+  phase: "started" | "stage" | "completed";
+  stage: string;
 };
 
 function coreIndexFile(root: string): string {
@@ -916,6 +1132,388 @@ function updateCoreFromReflection(root: string, reflection: LearningReflection, 
   return [renderedCore, longTermFile, indexFile];
 }
 
+function mergeCoreRecords(items: CoreIndexRecord[]): CoreIndexRecord[] {
+  const byKey = new Map<string, CoreIndexRecord>();
+
+  for (const item of items) {
+    const existing = byKey.get(item.key);
+    if (!existing) {
+      byKey.set(item.key, { ...item });
+      continue;
+    }
+
+    existing.hits += item.hits;
+    existing.score += item.score;
+    if (Date.parse(item.firstSeen) < Date.parse(existing.firstSeen)) {
+      existing.firstSeen = item.firstSeen;
+    }
+    if (Date.parse(item.lastSeen) > Date.parse(existing.lastSeen)) {
+      existing.lastSeen = item.lastSeen;
+      existing.text = item.text;
+      existing.kind = item.kind;
+    }
+  }
+
+  return [...byKey.values()];
+}
+
+async function redistillCoreIndex(
+  root: string,
+  config: SelfLearningConfig,
+  ctx: ExtensionContext,
+  limit?: number,
+  dryRun = false,
+  onProgress?: (progress: RedistillProgress) => void | Promise<void>,
+): Promise<RedistillCoreResult> {
+  const index = loadCoreIndex(root);
+  const before = index.items.length;
+  if (before === 0) {
+    return {
+      before,
+      after: before,
+      processed: 0,
+      changed: 0,
+      deduped: 0,
+      totalChunks: 0,
+      modelUsage: [],
+      model: "(none)",
+      diagnostics: [],
+      samples: [],
+    };
+  }
+
+  const sorted = sortedIndexItems(index);
+  const targetCount = Math.min(Math.max(1, limit || sorted.length), sorted.length);
+  const targetKeys = new Set(sorted.slice(0, targetCount).map((item) => item.key));
+  const targets = index.items.filter((item) => targetKeys.has(item.key));
+
+  const modelSelection = await buildRedistillModelCandidates(config, ctx);
+  if (modelSelection.candidates.length === 0) {
+    throw new Error([
+      "No reflection model with API key available for redistill.",
+      ...modelSelection.diagnostics,
+    ].join("\n"));
+  }
+
+  const primaryModelRef = modelRef(modelSelection.candidates[0].model);
+  const chunkModelUsage = new Map<string, number>();
+  const chunkSize = REDISTILL_CHUNK_SIZE;
+  const totalChunks = Math.max(1, Math.ceil(targets.length / chunkSize));
+  let processed = 0;
+  let changed = 0;
+  const rewrittenByKey = new Map<string, string>();
+  const samples: Array<{ kind: CoreKind; before: string; after: string }> = [];
+
+  for (let start = 0; start < targets.length; start += chunkSize) {
+    const currentChunk = Math.floor(start / chunkSize) + 1;
+    if (onProgress) {
+      await onProgress({
+        currentChunk,
+        totalChunks,
+        processed,
+        totalItems: targets.length,
+        phase: "started",
+        stage: "requesting model",
+      });
+    }
+    const chunk = targets.slice(start, start + chunkSize);
+    const payload = chunk.map((item, idx) => ({
+      id: start + idx,
+      kind: item.kind,
+      text: item.text,
+    }));
+
+    let parsed: Map<number, string> | undefined;
+    let usedModelRef = "";
+    const attemptErrors: string[] = [];
+    let lastOutputPreview = "(none)";
+
+    for (const candidate of modelSelection.candidates) {
+      const candidateRef = modelRef(candidate.model);
+      usedModelRef = candidateRef;
+
+      if (onProgress) {
+        await onProgress({
+          currentChunk,
+          totalChunks,
+          processed,
+          totalItems: targets.length,
+          phase: "stage",
+          stage: `requesting model (${candidate.source}:${candidateRef})`,
+        });
+      }
+
+      let rawForParsing = "";
+
+      try {
+        const response = await withTimeout(
+          complete(
+            candidate.model,
+            {
+              messages: [
+                {
+                  role: "user",
+                  content: [{ type: "text", text: buildRedistillPrompt(payload) }],
+                  timestamp: Date.now(),
+                },
+              ],
+            },
+            { apiKey: candidate.apiKey, maxTokens: REDISTILL_MODEL_MAX_TOKENS },
+          ),
+          redistillTimeoutMs(candidate.model, false),
+          `Redistill model call failed at chunk ${currentChunk}/${totalChunks} (${processed}/${targets.length}) for ${candidateRef}`,
+        );
+
+        if (onProgress) {
+          await onProgress({
+            currentChunk,
+            totalChunks,
+            processed,
+            totalItems: targets.length,
+            phase: "stage",
+            stage: `model response received (${candidateRef})`,
+          });
+        }
+
+        rawForParsing = extractTextFromResponseContent(response.content);
+        if (!rawForParsing) {
+          rawForParsing = previewResponseContent(response.content, 3000);
+        }
+        lastOutputPreview = compactText(rawForParsing, 700);
+
+        if (onProgress) {
+          await onProgress({
+            currentChunk,
+            totalChunks,
+            processed,
+            totalItems: targets.length,
+            phase: "stage",
+            stage: `parsing model output (${candidateRef})`,
+          });
+        }
+
+        parsed = parseRedistillOutput(rawForParsing);
+        if (!parsed) {
+          if (onProgress) {
+            await onProgress({
+              currentChunk,
+              totalChunks,
+              processed,
+              totalItems: targets.length,
+              phase: "stage",
+              stage: `repairing malformed output (${candidateRef})`,
+            });
+          }
+
+          const repairResponse = await withTimeout(
+            complete(
+              candidate.model,
+              {
+                messages: [
+                  {
+                    role: "user",
+                    content: [{ type: "text", text: buildRedistillRepairPrompt(rawForParsing, payload) }],
+                    timestamp: Date.now(),
+                  },
+                ],
+              },
+              { apiKey: candidate.apiKey, maxTokens: REDISTILL_REPAIR_MAX_TOKENS },
+            ),
+            redistillTimeoutMs(candidate.model, true),
+            `Redistill repair call failed at chunk ${currentChunk}/${totalChunks} (${processed}/${targets.length}) for ${candidateRef}`,
+          );
+
+          const repairRaw = extractTextFromResponseContent(repairResponse.content) || previewResponseContent(repairResponse.content, 3000);
+          lastOutputPreview = compactText(repairRaw, 700);
+          parsed = parseRedistillOutput(repairRaw);
+        }
+
+        if (parsed) {
+          chunkModelUsage.set(candidateRef, (chunkModelUsage.get(candidateRef) || 0) + 1);
+          break;
+        }
+
+        attemptErrors.push(`model=${candidateRef}: output could not be parsed`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        attemptErrors.push(`model=${candidateRef}: ${message}`);
+      }
+    }
+
+    if (!parsed) {
+      throw new Error(
+        [
+          `Could not parse redistill output as required JSON for chunk ${Math.floor(start / chunkSize) + 1}.`,
+          ...attemptErrors,
+          `last_model=${usedModelRef || "(none)"}`,
+          `output_preview=${lastOutputPreview}`,
+        ].join("\n"),
+      );
+    }
+
+    if (onProgress) {
+      await onProgress({
+        currentChunk,
+        totalChunks,
+        processed,
+        totalItems: targets.length,
+        phase: "stage",
+        stage: "applying rewrites",
+      });
+    }
+
+    for (let idx = 0; idx < chunk.length; idx++) {
+      const original = chunk[idx];
+      const id = start + idx;
+      const candidate = normalizeLearningText(parsed.get(id) || original.text);
+      const enforced =
+        original.kind === "antiPattern"
+          ? /^avoid:\s*/i.test(candidate)
+            ? candidate
+            : `Avoid: ${candidate}`
+          : candidate.replace(/^avoid:\s*/i, "");
+
+      const rewritten = normalizeLearningText(enforced) || normalizeLearningText(original.text);
+      rewrittenByKey.set(original.key, rewritten);
+      processed += 1;
+
+      if (learningKey(rewritten) !== learningKey(original.text)) {
+        changed += 1;
+        if (samples.length < 8) {
+          samples.push({ kind: original.kind, before: original.text, after: rewritten });
+        }
+      }
+    }
+
+    if (onProgress) {
+      await onProgress({
+        currentChunk,
+        totalChunks,
+        processed,
+        totalItems: targets.length,
+        phase: "completed",
+        stage: "chunk complete",
+      });
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  if (onProgress) {
+    await onProgress({
+      currentChunk: totalChunks,
+      totalChunks,
+      processed,
+      totalItems: targets.length,
+      phase: "stage",
+      stage: "merging rewritten items",
+    });
+  }
+
+  const rewrittenItems = index.items.map((item) => {
+    if (!targetKeys.has(item.key)) return item;
+    const rewrittenText = rewrittenByKey.get(item.key) || item.text;
+    return {
+      ...item,
+      text: rewrittenText,
+      key: learningKey(rewrittenText),
+    };
+  });
+
+  const mergedItems = mergeCoreRecords(rewrittenItems);
+  const after = mergedItems.length;
+  const deduped = rewrittenItems.length - mergedItems.length;
+
+  if (!dryRun) {
+    const updated: CoreIndex = {
+      ...index,
+      updatedAt: new Date().toISOString(),
+      items: mergedItems,
+    };
+
+    if (onProgress) {
+      await onProgress({
+        currentChunk: totalChunks,
+        totalChunks,
+        processed,
+        totalItems: targets.length,
+        phase: "stage",
+        stage: "ensuring git repository",
+      });
+    }
+    ensureGitRepo(root, config);
+
+    if (onProgress) {
+      await onProgress({
+        currentChunk: totalChunks,
+        totalChunks,
+        processed,
+        totalItems: targets.length,
+        phase: "stage",
+        stage: "writing memory files",
+      });
+    }
+    const files = [
+      renderCoreFromIndex(root, updated, Math.max(1, config.maxCoreItems || 20)),
+      renderLongTermMemoryFromIndex(root, updated),
+      saveCoreIndex(root, updated),
+    ];
+
+    if (onProgress) {
+      await onProgress({
+        currentChunk: totalChunks,
+        totalChunks,
+        processed,
+        totalItems: targets.length,
+        phase: "stage",
+        stage: "committing memory changes",
+      });
+    }
+    gitCommit(root, files, "chore(memory): redistill core learnings for global reuse", config);
+
+    return {
+      before,
+      after,
+      processed,
+      changed,
+      deduped,
+      totalChunks,
+      modelUsage: [...chunkModelUsage.entries()].map(([model, chunks]) => ({ model, chunks })),
+      files,
+      model: primaryModelRef,
+      diagnostics: [
+        ...modelSelection.diagnostics,
+        `redistill_model_usage=${
+          chunkModelUsage.size > 0
+            ? [...chunkModelUsage.entries()].map(([m, count]) => `${m}:${count}`).join(", ")
+            : "(none)"
+        }`,
+      ],
+      samples,
+    };
+  }
+
+  return {
+    before,
+    after,
+    processed,
+    changed,
+    deduped,
+    totalChunks,
+    modelUsage: [...chunkModelUsage.entries()].map(([model, chunks]) => ({ model, chunks })),
+    model: primaryModelRef,
+    diagnostics: [
+      ...modelSelection.diagnostics,
+      `redistill_model_usage=${
+        chunkModelUsage.size > 0
+          ? [...chunkModelUsage.entries()].map(([m, count]) => `${m}:${count}`).join(", ")
+          : "(none)"
+      }`,
+    ],
+    samples,
+  };
+}
+
 function collectMonthDailyFiles(root: string, month: string): string[] {
   const dir = dailyDir(root);
   if (!existsSync(dir)) return [];
@@ -928,6 +1526,23 @@ function collectMonthDailyFiles(root: string, month: string): string[] {
 function compactText(input: string, maxChars: number): string {
   if (input.length <= maxChars) return input;
   return `${input.slice(0, maxChars)}\n\n...(truncated)`;
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
+        }, ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function latestMonthlyFile(root: string): string | undefined {
@@ -1051,18 +1666,27 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
 
   const resolvedModel = `${picked.model.provider}/${picked.model.id}`;
 
-  const response = await complete(
-    picked.model,
-    {
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: buildReflectionPrompt(conversationText, config.maxLearnings) }],
-          timestamp: Date.now(),
-        },
-      ],
-    },
-    { apiKey: picked.apiKey, maxTokens: 900 },
+  const response = await withTimeout(
+    complete(
+      picked.model,
+      {
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: buildReflectionPrompt(conversationText, config.maxLearnings, config.storage.mode),
+              },
+            ],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      { apiKey: picked.apiKey, maxTokens: 900 },
+    ),
+    REFLECTION_MODEL_TIMEOUT_MS,
+    `Reflection model call failed for ${turnLabel}`,
   );
 
   const raw = extractTextFromResponseContent(response.content);
@@ -1086,18 +1710,22 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
   let repairResponseItems = 0;
 
   if (!parsed) {
-    const repairResponse = await complete(
-      picked.model,
-      {
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: buildReflectionRepairPrompt(raw) }],
-            timestamp: Date.now(),
-          },
-        ],
-      },
-      { apiKey: picked.apiKey, maxTokens: 900 },
+    const repairResponse = await withTimeout(
+      complete(
+        picked.model,
+        {
+          messages: [
+            {
+              role: "user",
+              content: [{ type: "text", text: buildReflectionRepairPrompt(raw) }],
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        { apiKey: picked.apiKey, maxTokens: 900 },
+      ),
+      REFLECTION_REPAIR_TIMEOUT_MS,
+      `Reflection repair call failed for ${turnLabel}`,
     );
 
     repairResponseItems = Array.isArray(repairResponse.content) ? repairResponse.content.length : 0;
@@ -1161,18 +1789,22 @@ async function generateMonthSummary(
   const picked = await pickReflectionModel(config, ctx);
   if (!picked.model || !picked.apiKey) return { dailyCount: files.length };
 
-  const response = await complete(
-    picked.model,
-    {
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: buildMonthPrompt(month, monthText) }],
-          timestamp: Date.now(),
-        },
-      ],
-    },
-    { apiKey: picked.apiKey, maxTokens: 2500 },
+  const response = await withTimeout(
+    complete(
+      picked.model,
+      {
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: buildMonthPrompt(month, monthText) }],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      { apiKey: picked.apiKey, maxTokens: 2500 },
+    ),
+    MONTH_SUMMARY_MODEL_TIMEOUT_MS,
+    `Monthly summary model call failed for ${month}`,
   );
 
   const summary = response.content
@@ -1200,6 +1832,7 @@ export default function (pi: ExtensionAPI) {
     const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
 
     if (!isLearningEnabled(config, ctx) || !isAutoReflectionEnabled(config)) return;
+    if (Date.now() < skipAutoReflectionUntil) return;
 
     try {
       if (ctx.hasUI) ctx.ui.setWorkingMessage("learning");
@@ -1311,6 +1944,177 @@ export default function (pi: ExtensionAPI) {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`learning-month failed: ${message}`, "error");
+      } finally {
+        if (ctx.hasUI) ctx.ui.setWorkingMessage();
+      }
+    },
+  });
+
+  pi.registerCommand("learning-redistill", {
+    description: "Re-distill core memory into cross-project rules: /learning-redistill [limit] [--dry-run] [--yes]",
+    handler: async (args, ctx) => {
+      skipAutoReflectionUntil = Date.now() + REDISTILL_SKIP_AUTO_REFLECTION_MS;
+      ctx.ui.notify(`learning-redistill invoked with args: ${args.trim() || "(none)"}`, "info");
+
+      const tokens = args
+        .trim()
+        .split(/\s+/)
+        .map((t) => t.trim())
+        .filter(Boolean);
+
+      let dryRun = false;
+      let assumeYes = false;
+      let limit: number | undefined;
+
+      for (const token of tokens) {
+        if (token === "--dry-run") {
+          dryRun = true;
+          continue;
+        }
+        if (token === "--yes") {
+          assumeYes = true;
+          continue;
+        }
+        if (/^\d+$/.test(token)) {
+          if (limit !== undefined) {
+            ctx.ui.notify("Usage: /learning-redistill [limit] [--dry-run] [--yes]", "warning");
+            return;
+          }
+          limit = Number(token);
+          continue;
+        }
+
+        ctx.ui.notify("Usage: /learning-redistill [limit] [--dry-run] [--yes]", "warning");
+        return;
+      }
+
+      if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
+        ctx.ui.notify("Limit must be a positive integer", "warning");
+        return;
+      }
+
+      const settings = loadMergedSettings(ctx.cwd);
+      const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
+      const root = resolveStorageRoot(config, ctx.cwd);
+
+      if (config.storage.mode !== "global") {
+        ctx.ui.notify(
+          "learning-redistill is intended for global memory. Set selfLearning.storage.mode=global before running.",
+          "warning",
+        );
+        return;
+      }
+
+      const index = loadCoreIndex(root);
+      const targetCount = Math.min(limit || index.items.length, index.items.length);
+      if (targetCount === 0) {
+        ctx.ui.notify(`No core entries found in ${coreIndexFile(root)}`, "warning");
+        return;
+      }
+
+      if (!dryRun && !assumeYes && targetCount > 200) {
+        const ui = ctx.ui as unknown as { confirm?: (message: string) => Promise<boolean | undefined> };
+
+        if (!ui.confirm) {
+          ctx.ui.notify(
+            `This operation will process ${targetCount} entries. Re-run with --yes to proceed, or use --dry-run first.`,
+            "warning",
+          );
+          return;
+        }
+
+        const confirmed = await ui.confirm(
+          `Re-distill ${targetCount} entries in global memory using model calls. Continue?`,
+        );
+
+        if (!confirmed) {
+          ctx.ui.notify("learning-redistill cancelled", "info");
+          return;
+        }
+      }
+
+      try {
+        if (ctx.hasUI) ctx.ui.setWorkingMessage("learning redistill: preparing");
+
+        const estimatedChunks = Math.max(1, Math.ceil(targetCount / REDISTILL_CHUNK_SIZE));
+        ctx.ui.notify(
+          `Starting redistill: entries=${targetCount}, estimated_chunks=${estimatedChunks}, chunk_size=${REDISTILL_CHUNK_SIZE}, timeout_per_chunk=${Math.round(REDISTILL_MODEL_TIMEOUT_MS / 1000)}s, max_tokens=${REDISTILL_MODEL_MAX_TOKENS}, mode=${dryRun ? "dry-run" : "write"}`,
+          "info",
+        );
+
+        const startedAt = Date.now();
+        let lastProgressLine = "";
+        const result = await redistillCoreIndex(root, config, ctx, limit, dryRun, async (progress) => {
+          const line = `chunk ${progress.currentChunk}/${progress.totalChunks} ${progress.phase} (${progress.processed}/${progress.totalItems}): ${progress.stage}`;
+
+          if (ctx.hasUI) {
+            ctx.ui.setWorkingMessage(`learning redistill: ${line}`);
+          }
+
+          if (
+            line !== lastProgressLine &&
+            (progress.phase === "started" || progress.phase === "completed" || progress.currentChunk === 1)
+          ) {
+            lastProgressLine = line;
+            ctx.ui.notify(`Redistill progress: ${line}`, "info");
+          }
+        });
+        const action = dryRun ? "Dry run completed" : "Redistill completed";
+
+        ctx.ui.notify(
+          `${action}: processed=${result.processed}, changed=${result.changed}, deduped=${result.deduped}, items=${result.before}->${result.after}, model=${result.model}`,
+          "info",
+        );
+
+        if (result.samples.length > 0) {
+          const preview = result.samples
+            .slice(0, 3)
+            .map(
+              (sample, idx) =>
+                `${idx + 1}. [${sample.kind}] ${compactText(sample.before, 90)} -> ${compactText(sample.after, 90)}`,
+            )
+            .join("\n");
+          ctx.ui.notify(`Sample rewrites:\n${preview}`, "info");
+        }
+
+        if (result.files && result.files.length > 0) {
+          ctx.ui.notify(`Updated files:\n${result.files.map((f) => `- ${f}`).join("\n")}`, "info");
+        }
+
+        if (result.diagnostics.length > 0) {
+          const shownDiagnostics = result.diagnostics.slice(0, 8).map((d) => compactText(d, 180));
+          const extra = result.diagnostics.length > shownDiagnostics.length ? `\n- ... (+${result.diagnostics.length - shownDiagnostics.length} more)` : "";
+          ctx.ui.notify(`Model diagnostics:\n${shownDiagnostics.map((d) => `- ${d}`).join("\n")}${extra}`, "info");
+        }
+
+        const elapsedMs = Date.now() - startedAt;
+        const changedPct = result.processed > 0 ? Math.round((result.changed / result.processed) * 100) : 0;
+        const usage =
+          result.modelUsage.length > 0
+            ? result.modelUsage.map((m) => `${m.model}:${m.chunks}`).join(", ")
+            : "(none)";
+
+        ctx.ui.notify(
+          [
+            "Redistill stats:",
+            `- mode: ${dryRun ? "dry-run" : "write"}`,
+            `- elapsed: ${(elapsedMs / 1000).toFixed(1)}s`,
+            `- chunks: ${result.totalChunks}`,
+            `- processed: ${result.processed}`,
+            `- changed: ${result.changed} (${changedPct}%)`,
+            `- deduped: ${result.deduped}`,
+            `- items: ${result.before} -> ${result.after}`,
+            `- model usage: ${usage}`,
+          ].join("\n"),
+          "info",
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const hint =
+          /timed out/i.test(message)
+            ? "\nHint: try /learning-redistill 100 --dry-run, switch redistill model with /learning-model-global or selfLearning.model, or rerun with a smaller limit."
+            : "";
+        ctx.ui.notify(`learning-redistill failed: ${message}${hint}`, "error");
       } finally {
         if (ctx.hasUI) ctx.ui.setWorkingMessage();
       }
