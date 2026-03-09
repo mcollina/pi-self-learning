@@ -723,7 +723,7 @@ async function pickReflectionModel(config: SelfLearningConfig, ctx: ExtensionCon
 type RedistillModelCandidate = {
   model: NonNullable<ReturnType<typeof getModel>>;
   apiKey: string;
-  source: "configured";
+  source: "configured" | "current";
 };
 
 function modelRef(model: { provider: string; id: string }): string {
@@ -742,22 +742,31 @@ async function buildRedistillModelCandidates(config: SelfLearningConfig, ctx: Ex
   const candidates: RedistillModelCandidate[] = [];
 
   const configured = configuredModel(config);
-  if (!configured) {
-    diagnostics.push("configured.model=(none)");
-    diagnostics.push("redistill requires an explicit selfLearning.model (provider/id)");
-    return { candidates, diagnostics };
-  }
 
-  diagnostics.push(`configured.model=${configured.provider}/${configured.id}`);
+  if (configured) {
+    diagnostics.push(`configured.model=${configured.provider}/${configured.id}`);
 
-  const registry = ctx.modelRegistry as unknown as {
-    find?: (provider: string, id: string) => NonNullable<ReturnType<typeof getModel>> | undefined;
-    getAvailable?: () => Promise<Array<{ provider?: string; id?: string }>>;
-  };
+    const registry = ctx.modelRegistry as unknown as {
+      find?: (provider: string, id: string) => NonNullable<ReturnType<typeof getModel>> | undefined;
+      getAvailable?: () => Promise<Array<{ provider?: string; id?: string }>>;
+    };
 
-  const model = registry.find?.(configured.provider, configured.id) ?? getModel(configured.provider, configured.id);
-  if (!model) {
-    diagnostics.push(`configured.model_not_found=${configured.provider}/${configured.id}`);
+    const model = registry.find?.(configured.provider, configured.id) ?? getModel(configured.provider, configured.id);
+    if (model) {
+      const apiKey = await ctx.modelRegistry.getApiKey(model);
+      if (apiKey) {
+        candidates.push({
+          model,
+          apiKey,
+          source: "configured",
+        });
+        diagnostics.push(`redistill_candidates=configured:${modelRef(model)}`);
+        return { candidates, diagnostics };
+      }
+      diagnostics.push(`configured.model_api_key_missing=${configured.provider}/${configured.id}`);
+    } else {
+      diagnostics.push(`configured.model_not_found=${configured.provider}/${configured.id}`);
+    }
 
     try {
       const available = (await registry.getAvailable?.()) ?? [];
@@ -769,23 +778,26 @@ async function buildRedistillModelCandidates(config: SelfLearningConfig, ctx: Ex
     } catch {
       diagnostics.push("valid_models=(unavailable from model registry)");
     }
-
-    return { candidates, diagnostics };
+  } else {
+    diagnostics.push("configured.model=(none)");
   }
 
-  const apiKey = await ctx.modelRegistry.getApiKey(model);
-  if (!apiKey) {
-    diagnostics.push(`configured.model_api_key_missing=${configured.provider}/${configured.id}`);
-    return { candidates, diagnostics };
+  if (ctx.model) {
+    const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+    if (apiKey) {
+      candidates.push({
+        model: ctx.model,
+        apiKey,
+        source: "current",
+      });
+      diagnostics.push(`redistill_candidates=current:${modelRef(ctx.model)}`);
+      return { candidates, diagnostics };
+    }
+    diagnostics.push(`current_model_api_key_missing=${ctx.model.provider}/${ctx.model.id}`);
+  } else {
+    diagnostics.push("current_model=(none)");
   }
 
-  candidates.push({
-    model,
-    apiKey,
-    source: "configured",
-  });
-
-  diagnostics.push(`redistill_candidates=configured:${modelRef(model)}`);
   return { candidates, diagnostics };
 }
 

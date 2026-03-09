@@ -150,7 +150,9 @@ If the configured model is missing/invalid, diagnostics include the reason and a
 
 Redistill model resolution:
 
-- `/learning-redistill` requires an explicit configured model (`selfLearning.model`) and does not use the current session model fallback.
+- `/learning-redistill` first tries the configured `selfLearning.model`
+- If no configured model or it lacks API key, falls back to current session model (`ctx.model`)
+- If neither is available, diagnostics show the failure reason and available models
 ## Key extension commands
 
 Implemented in `self-learning.ts`:
