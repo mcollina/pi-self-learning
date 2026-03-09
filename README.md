@@ -1,6 +1,6 @@
 # pi-self-learning
 
-A [pi](https://github.com/mariozechner/pi) extension that keeps a **git-backed memory** of each session:
+A [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) extension that keeps a **git-backed memory** of each session:
 
 - automatic task-level reflections
 - daily logs
