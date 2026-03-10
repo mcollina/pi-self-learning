@@ -136,6 +136,8 @@ On `before_agent_start`, extension can inject:
 - bundled memory files (`core`, optional latest monthly, optional last N daily)
 - optional system prompt memory policy (`instructionMode`: off/advisory/strict)
 
+Important path rule: injected headings and memory-policy instructions must reference the resolved memory file paths under the actual memory root, not synthetic `core/CORE.md` paths relative to the agent's current cwd. In project mode, resolve relative storage paths from the nearest ancestor `.pi/settings.json` (or nearest git root if no project settings file exists).
+
 Keep this flow intact when editing; it is how historical memory influences future turns.
 
 ### 6) Model resolution for reflections

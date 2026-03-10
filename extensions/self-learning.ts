@@ -162,8 +162,27 @@ function globalSettingsPath(): string {
   return join(getAgentDir(), "settings.json");
 }
 
+function findAncestorDir(start: string, matches: (dir: string) => boolean): string | undefined {
+  let current = start;
+
+  while (true) {
+    if (matches(current)) return current;
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+function resolveProjectBaseDir(cwd: string): string {
+  return (
+    findAncestorDir(cwd, (dir) => existsSync(join(dir, ".pi", "settings.json"))) ||
+    findAncestorDir(cwd, (dir) => existsSync(join(dir, ".git"))) ||
+    cwd
+  );
+}
+
 function projectSettingsPath(cwd: string): string {
-  return join(cwd, ".pi", "settings.json");
+  return join(resolveProjectBaseDir(cwd), ".pi", "settings.json");
 }
 
 function loadMergedSettings(cwd: string): JsonObject {
@@ -230,7 +249,7 @@ function resolveStorageRoot(config: SelfLearningConfig, cwd: string): string {
     return expandHome(config.storage.globalPath);
   }
   const projectPath = config.storage.projectPath;
-  return isAbsolute(projectPath) ? projectPath : join(cwd, projectPath);
+  return isAbsolute(projectPath) ? projectPath : join(resolveProjectBaseDir(cwd), projectPath);
 }
 
 function dailyDir(root: string): string {
@@ -251,6 +270,13 @@ function coreFile(root: string): string {
 
 function longTermMemoryFile(root: string): string {
   return join(root, "long-term-memory.md");
+}
+
+function pathForPrompt(path: string, cwd: string): string {
+  const relativePath = relative(cwd, path);
+  if (!relativePath) return ".";
+  if (!relativePath.startsWith("..") && !isAbsolute(relativePath)) return relativePath;
+  return path;
 }
 
 function appendDailyEntry(root: string, when: Date, content: string): string {
@@ -1581,7 +1607,7 @@ function readTrimmedFile(file: string, maxChars: number): string {
   return compactText(raw, maxChars);
 }
 
-function buildMemoryContextBundle(root: string, config: SelfLearningConfig): string | undefined {
+function buildMemoryContextBundle(root: string, config: SelfLearningConfig, cwd: string): string | undefined {
   const sections: string[] = [];
   const maxChars = Math.max(2000, config.context.maxChars || 12000);
   const maxPerFile = Math.max(1000, Math.floor(maxChars / 4));
@@ -1589,21 +1615,21 @@ function buildMemoryContextBundle(root: string, config: SelfLearningConfig): str
   if (config.context.includeCore) {
     const core = coreFile(root);
     if (existsSync(core)) {
-      sections.push(`## core/CORE.md\n${readTrimmedFile(core, maxPerFile)}`);
+      sections.push(`## ${pathForPrompt(core, cwd)}\n${readTrimmedFile(core, maxPerFile)}`);
     }
   }
 
   const dailyTake = Math.max(0, config.context.includeLastNDaily || 0);
   if (dailyTake > 0) {
     for (const daily of latestDailyFiles(root, dailyTake)) {
-      sections.push(`## ${relative(root, daily)}\n${readTrimmedFile(daily, maxPerFile)}`);
+      sections.push(`## ${pathForPrompt(daily, cwd)}\n${readTrimmedFile(daily, maxPerFile)}`);
     }
   }
 
   if (config.context.includeLatestMonthly) {
     const monthly = latestMonthlyFile(root);
     if (monthly && existsSync(monthly)) {
-      sections.push(`## ${relative(root, monthly)}\n${readTrimmedFile(monthly, maxPerFile)}`);
+      sections.push(`## ${pathForPrompt(monthly, cwd)}\n${readTrimmedFile(monthly, maxPerFile)}`);
     }
   }
 
@@ -1613,6 +1639,7 @@ function buildMemoryContextBundle(root: string, config: SelfLearningConfig): str
     [
       "# Self-learning memory context",
       "Use this as historical evidence.",
+      `Resolved memory root: ${pathForPrompt(root, cwd)}`,
       "",
       ...sections,
     ].join("\n\n"),
@@ -1620,7 +1647,7 @@ function buildMemoryContextBundle(root: string, config: SelfLearningConfig): str
   );
 }
 
-function buildMemoryInstruction(config: SelfLearningConfig): string {
+function buildMemoryInstruction(config: SelfLearningConfig, root: string, cwd: string): string {
   if (config.context.instructionMode === "off") return "";
 
   const strictPrefix =
@@ -1628,14 +1655,21 @@ function buildMemoryInstruction(config: SelfLearningConfig): string {
       ? "You MUST consult self-learning memory when the user asks about history, prior decisions, patterns, regressions, or follow-up work."
       : "Consult self-learning memory when relevant to history and prior decisions.";
 
+  const rootPath = pathForPrompt(root, cwd);
+  const corePath = pathForPrompt(coreFile(root), cwd);
+  const dailyPath = pathForPrompt(dailyDir(root), cwd);
+  const monthlyPath = pathForPrompt(monthlyDir(root), cwd);
+  const longTermPath = pathForPrompt(longTermMemoryFile(root), cwd);
+
   return [
     strictPrefix,
+    `Self-learning memory lives under ${rootPath}.`,
     "Memory policy:",
-    "1) Start from core/CORE.md for durable learnings.",
-    "2) For historical questions, check daily/*.md then monthly/*.md.",
+    `1) Start from ${corePath} for durable learnings.`,
+    `2) For historical questions, check ${dailyPath}/*.md then ${monthlyPath}/*.md.`,
     "3) Prefer evidence from memory files over guessing.",
     "4) If evidence is missing, explicitly state that and suggest searching memory logs.",
-    "5) If you are stuck and need help, consult long-term-memory.md for broader prior fixes and mistakes.",
+    `5) If you are stuck and need help, consult ${longTermPath} for broader prior fixes and mistakes.`,
   ].join("\n");
 }
 
@@ -1865,6 +1899,7 @@ export default function (pi: ExtensionAPI) {
     if (!isLearningEnabled(config, ctx)) return;
 
     const pieces: string[] = [];
+    const root = config.context.enabled ? resolveStorageRoot(config, ctx.cwd) : undefined;
 
     if (RUNTIME_NOTES.length > 0) {
       const take = Math.max(1, config.injectLastN || 5);
@@ -1872,13 +1907,12 @@ export default function (pi: ExtensionAPI) {
       pieces.push(`## Recent turn notes\n${last}`);
     }
 
-    if (config.context.enabled) {
-      const root = resolveStorageRoot(config, ctx.cwd);
-      const bundle = buildMemoryContextBundle(root, config);
+    if (config.context.enabled && root) {
+      const bundle = buildMemoryContextBundle(root, config, ctx.cwd);
       if (bundle) pieces.push(bundle);
     }
 
-    const instruction = config.context.enabled ? buildMemoryInstruction(config) : "";
+    const instruction = config.context.enabled && root ? buildMemoryInstruction(config, root, ctx.cwd) : "";
     if (pieces.length === 0 && !instruction) return;
 
     return {
