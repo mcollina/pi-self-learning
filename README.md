@@ -113,6 +113,8 @@ Prompt scope depends on storage mode:
 - `storage.mode: "project"` keeps repository-specific details when they are useful.
 - `storage.mode: "global"` distills reflections into cross-project, reusable action rules and avoids project-specific identifiers.
 
+For project storage, relative memory paths are resolved from the project root (nearest ancestor `.pi/settings.json`, otherwise nearest git root), not from an agent's current subdirectory.
+
 If you already have legacy global entries with project-specific wording, run:
 - `/learning-redistill` to rewrite all existing core index entries
 - `/learning-redistill 300 --dry-run` to preview impact on a subset without writing files
@@ -123,19 +125,21 @@ If you already have legacy global entries with project-specific wording, run:
 
 Use `selfLearning.context` to inject memory into each turn:
 
-- `includeCore`: inject `core/CORE.md` (enabled by default)
-- `includeLatestMonthly`: inject latest `monthly/YYYY-MM.md` (disabled by default)
-- `includeLastNDaily`: inject last N daily files from `daily/` (default `0`)
+- `includeCore`: inject the resolved `CORE.md` under the configured memory root (enabled by default)
+- `includeLatestMonthly`: inject the latest resolved `monthly/YYYY-MM.md` file (disabled by default)
+- `includeLastNDaily`: inject the last N resolved `daily/YYYY-MM-DD.md` files (default `0`)
 - `instructionMode`:
   - `off`: do not add memory policy to system prompt
   - `advisory`: suggest checking memory logs
   - `strict`: enforce checking memory logs for history-related questions
 
+Injected headings and strict-mode instructions use the resolved file locations (for example `.pi/self-learning-memory/core/CORE.md` in project mode, or `~/.pi/agent/self-learning-memory/core/CORE.md` in global mode).
+
 With `instructionMode: "strict"`, the extension appends policy telling the assistant to:
-1. consult `core/CORE.md` first,
-2. check `daily/*.md` then `monthly/*.md` for historical questions,
+1. consult the resolved `.../core/CORE.md` first,
+2. check the resolved `.../daily/*.md` then `.../monthly/*.md` for historical questions,
 3. prefer evidence over guessing,
-4. if stuck, consult `long-term-memory.md` for broader prior fixes and mistakes.
+4. if stuck, consult the resolved `.../long-term-memory.md` for broader prior fixes and mistakes.
 
 ## Commands
 
