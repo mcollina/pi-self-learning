@@ -121,6 +121,12 @@ const MONTH_SUMMARY_MODEL_TIMEOUT_MS = 120_000;
 const GIT_FAST_TIMEOUT_MS = 15_000;
 const GIT_COMMIT_TIMEOUT_MS = 30_000;
 const REDISTILL_SKIP_AUTO_REFLECTION_MS = 5 * 60_000;
+const INTERRUPTION_SIGNAL_MAX = 8;
+const BLOCKED_COMMAND_PATTERN =
+  /\b(blocked|not allowed|forbidden|denied by|disallowed|policy|blocked by user|blocked by an extension|user denied|dangerous command|refused)\b/i;
+const PERMISSION_DENIED_PATTERN =
+  /\b(permission denied|operation not permitted|eacces|eperm|unauthorized|access denied|permission\s+negated)\b/i;
+const USER_CANCEL_PATTERN = /\b(cancelled by user|canceled by user|aborted by user|user cancelled|user canceled)\b/i;
 let skipAutoReflectionUntil = 0;
 
 function isPlainObject(value: unknown): value is JsonObject {
@@ -445,10 +451,83 @@ function previewResponseContent(content: unknown, maxChars = 1200): string {
   return compactText(rendered, maxChars);
 }
 
+function extractMessageText(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .filter((item): item is { type: string; text?: unknown } => isPlainObject(item) && typeof item.type === "string")
+    .map((item) => (item.type === "text" && typeof item.text === "string" ? item.text : ""))
+    .join("\n")
+    .trim();
+}
+
+function collectInterruptionSignals(ctx: ExtensionContext, maxEntriesToScan: number): string[] {
+  const branch = ctx.sessionManager.getBranch() as SessionEntry[];
+  if (branch.length === 0) return [];
+
+  const entries = branch.slice(-Math.max(1, maxEntriesToScan));
+  const signals: string[] = [];
+  const seen = new Set<string>();
+
+  const push = (line: string) => {
+    const normalized = line.toLowerCase();
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    signals.push(line);
+  };
+
+  for (const entry of entries) {
+    if (entry.type !== "message" || !isPlainObject(entry.message)) continue;
+
+    const message = entry.message as JsonObject;
+    const role = typeof message.role === "string" ? message.role : "";
+
+    if (role === "assistant") {
+      const stopReason = typeof message.stopReason === "string" ? message.stopReason : "";
+      if (stopReason === "aborted") {
+        push("Assistant response was aborted/interrupted by the user (often Esc/abort). Treat this as an intent-change signal.");
+      }
+      continue;
+    }
+
+    if (role !== "toolResult") continue;
+
+    const toolName = typeof message.toolName === "string" ? message.toolName : "(unknown tool)";
+    const text = extractMessageText(message.content);
+    const textPreview = compactText(text || "(no text)", 180).replace(/\s+/g, " ").trim();
+    const isError = message.isError === true;
+
+    if (/skipped due to queued user message/i.test(text)) {
+      push(`Tool ${toolName} was skipped because the user interrupted and queued a new direction.`);
+      continue;
+    }
+
+    if (!isError) continue;
+
+    if (PERMISSION_DENIED_PATTERN.test(text)) {
+      push(`Tool ${toolName} failed with a permission denial: ${textPreview}`);
+      continue;
+    }
+
+    if (BLOCKED_COMMAND_PATTERN.test(text)) {
+      push(`Tool ${toolName} was blocked/denied by constraints: ${textPreview}`);
+      continue;
+    }
+
+    if (USER_CANCEL_PATTERN.test(text)) {
+      push(`Tool ${toolName} was user-cancelled: ${textPreview}`);
+    }
+  }
+
+  return signals.slice(0, INTERRUPTION_SIGNAL_MAX);
+}
+
 function buildReflectionPrompt(
   conversationText: string,
   maxLearnings: number,
   storageMode: SelfLearningConfig["storage"]["mode"],
+  interruptionSignals: string[] = [],
 ): string {
   const scopeRules =
     storageMode === "global"
@@ -459,6 +538,20 @@ function buildReflectionPrompt(
           "- Prefer imperative wording (e.g., 'Validate X before Y').",
         ]
       : ["- Keep concrete details that are useful for this specific project/repository."];
+
+  const interruptionRules =
+    interruptionSignals.length > 0
+      ? [
+          "- Treat interruption/blocked/permission signals as intentional user-boundary evidence.",
+          "- Infer why the user stopped the flow and include at least one prevention-oriented mistake and one concrete fix for it.",
+          "- Do not frame user interruption as random failure.",
+        ]
+      : [];
+
+  const interruptionSection =
+    interruptionSignals.length > 0
+      ? ["", "<interruption_signals>", ...interruptionSignals.map((line) => `- ${line}`), "</interruption_signals>"]
+      : [];
 
   return [
     "You are a coding session mistake-prevention reflection engine.",
@@ -471,10 +564,12 @@ function buildReflectionPrompt(
     "- Prefer specific, actionable, prevention-oriented points.",
     "- Avoid generic statements and progress summaries.",
     ...scopeRules,
+    ...interruptionRules,
     "",
     "<conversation>",
     conversationText,
     "</conversation>",
+    ...interruptionSection,
   ].join("\n");
 }
 
@@ -1702,6 +1797,8 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
   const conversationText = serializeConversation(convertToLlm(messages as any));
   if (!conversationText.trim()) return { reason: "empty_conversation" };
 
+  const interruptionSignals = collectInterruptionSignals(ctx, Math.max(config.maxMessagesForReflection * 4, 24));
+
   const picked = await pickReflectionModel(config, ctx);
   if (!picked.model || !picked.apiKey) {
     return {
@@ -1722,7 +1819,12 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
             content: [
               {
                 type: "text",
-                text: buildReflectionPrompt(conversationText, config.maxLearnings, config.storage.mode),
+                text: buildReflectionPrompt(
+                  conversationText,
+                  config.maxLearnings,
+                  config.storage.mode,
+                  interruptionSignals,
+                ),
               },
             ],
             timestamp: Date.now(),
