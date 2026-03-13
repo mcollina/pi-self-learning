@@ -78,7 +78,7 @@ Settings merge is deep for plain objects (`deepMerge`).
 
 On `agent_end` (when enabled and `autoAfterTask`):
 
-1. collect recent branch messages (`maxMessagesForReflection`)
+1. collect recent branch messages (`maxMessagesForReflection`) and interruption signals (blocked commands, permission denials, user abort/esc interrupts)
 2. serialize conversation to text
 3. run LLM reflection prompt expecting strict JSON:
    - mistakes
@@ -175,4 +175,5 @@ When adding or changing behavior, update command descriptions and `README.md` in
 
 - Keep timestamps/date partitioning in UTC (`toDateKeyUTC`, `toMonthKeyUTC`, `toTimeUTC`) unless migrating all readers/writers.
 - Preserve non-blocking behavior in turn hooks; extension should not break normal agent flow.
+- Preserve reflection handling for interruption signals (blocked tools, permission denials, user interrupts) as first-class learning inputs.
 - If you change memory file formats (`daily`, `monthly`, `core/index.json`, `long-term-memory.md`), include migration/backward-compat handling in code.

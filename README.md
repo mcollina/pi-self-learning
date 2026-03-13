@@ -12,6 +12,7 @@ A [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) exte
 
 After each completed agent task (when enabled), it:
 1. extracts what went wrong and how it was fixed,
+   - including interruption signals such as blocked commands, permission denials, and user aborts (Esc/interrupt) as intent boundaries to analyze,
 2. appends the entry to a daily markdown file,
 3. updates `core/CORE.md` with top-ranked durable learnings (balanced across learnings + watch-outs),
 4. writes full history to `long-term-memory.md`,
@@ -157,4 +158,5 @@ With `instructionMode: "strict"`, the extension appends policy telling the assis
 
 - Reflection errors are non-blocking.
 - If model/API key is unavailable, reflection is skipped gracefully.
+- During reflection, blocked/denied/cancelled execution signals are treated as meaningful user intent and should produce preventive learnings when present.
 - Memory repo commits are automatic after each memory update (if enabled).
