@@ -120,7 +120,7 @@ If you already have legacy global entries with project-specific wording, run:
 - `/learning-redistill` to rewrite all existing core index entries
 - `/learning-redistill 300 --dry-run` to preview impact on a subset without writing files
 
-`/learning-redistill` uses the configured `selfLearning.model` (not the current session model). Set it via `.pi/settings.json` or `/learning-model-global`.
+`/learning-redistill` tries the configured `selfLearning.model` first, then falls back to the current session model if needed. Set the configured model via `.pi/settings.json` or `/learning-model-global`.
 
 ## Loading memory into context
 
@@ -157,6 +157,6 @@ With `instructionMode: "strict"`, the extension appends policy telling the assis
 ## Notes
 
 - Reflection errors are non-blocking.
-- If model/API key is unavailable, reflection is skipped gracefully.
+- If the configured model cannot resolve request auth (or the session model fallback cannot), reflection is skipped gracefully.
 - During reflection, blocked/denied/cancelled execution signals are treated as meaningful user intent and should produce preventive learnings when present.
 - Memory repo commits are automatic after each memory update (if enabled).
