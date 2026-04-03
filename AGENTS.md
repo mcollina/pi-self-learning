@@ -147,13 +147,14 @@ Reflection model selection order:
 1. merged config model (`selfLearning.model`)
 2. fallback current `ctx.model`
 
-The extension only uses a candidate if an API key is available from `ctx.modelRegistry`.
+The extension only uses a candidate if request auth resolves from `ctx.modelRegistry`.
+Prefer `getApiKeyAndHeaders()` on newer pi versions, with a backward-compatible fallback to legacy `getApiKey()` for older hosts.
 If the configured model is missing/invalid, diagnostics include the reason and available model list.
 
 Redistill model resolution:
 
 - `/learning-redistill` first tries the configured `selfLearning.model`
-- If no configured model or it lacks API key, falls back to current session model (`ctx.model`)
+- If no configured model or it cannot resolve request auth, falls back to current session model (`ctx.model`)
 - If neither is available, diagnostics show the failure reason and available models
 ## Key extension commands
 

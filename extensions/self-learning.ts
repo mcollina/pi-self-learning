@@ -20,6 +20,11 @@ type ModelRef = {
   id: string;
 };
 
+type ModelRequestAuth = {
+  apiKey?: string;
+  headers?: Record<string, string>;
+};
+
 type SelfLearningConfig = {
   enabled: boolean;
   autoAfterTask: boolean;
@@ -748,10 +753,59 @@ function configuredModel(config: SelfLearningConfig): ModelRef | undefined {
   return undefined;
 }
 
+async function resolveModelRequestAuth(
+  ctx: ExtensionContext,
+  model: { provider: string; id: string },
+): Promise<{ ok: true; auth: ModelRequestAuth } | { ok: false; error: string }> {
+  const registry = ctx.modelRegistry as unknown as {
+    getApiKeyAndHeaders?: (
+      model: { provider: string; id: string },
+    ) => Promise<
+      | { ok: true; apiKey?: string; headers?: Record<string, string> }
+      | { ok: false; error: string }
+    >;
+    getApiKey?: (model: { provider: string; id: string }) => Promise<string | undefined>;
+  };
+
+  try {
+    if (typeof registry.getApiKeyAndHeaders === "function") {
+      const auth = await registry.getApiKeyAndHeaders(model);
+      if (!auth.ok) {
+        return { ok: false, error: auth.error || `Could not resolve request auth for ${model.provider}/${model.id}` };
+      }
+      return {
+        ok: true,
+        auth: {
+          apiKey: auth.apiKey,
+          headers: auth.headers,
+        },
+      };
+    }
+
+    if (typeof registry.getApiKey === "function") {
+      const apiKey = await registry.getApiKey(model);
+      if (apiKey) {
+        return {
+          ok: true,
+          auth: { apiKey },
+        };
+      }
+      return { ok: false, error: `No API key available for ${model.provider}/${model.id}` };
+    }
+
+    return { ok: false, error: "ctx.modelRegistry does not expose getApiKeyAndHeaders() or getApiKey()" };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 async function getAvailableModelRefs(ctx: ExtensionContext): Promise<ModelRef[]> {
   try {
     const registry = ctx.modelRegistry as unknown as {
-      getAvailable?: () => Promise<Array<{ provider?: string; id?: string }>>;
+      getAvailable?: () => Array<{ provider?: string; id?: string }> | Promise<Array<{ provider?: string; id?: string }>>;
     };
 
     const models = (await registry.getAvailable?.()) ?? [];
@@ -777,7 +831,7 @@ async function pickReflectionModel(config: SelfLearningConfig, ctx: ExtensionCon
 
     try {
       const registry = ctx.modelRegistry as unknown as {
-        getAvailable?: () => Promise<Array<{ provider?: string; id?: string }>>;
+        getAvailable?: () => Array<{ provider?: string; id?: string }> | Promise<Array<{ provider?: string; id?: string }>>;
       };
 
       const available = (await registry.getAvailable?.()) ?? [];
@@ -815,12 +869,12 @@ async function pickReflectionModel(config: SelfLearningConfig, ctx: ExtensionCon
       diagnostics.push(`config_model_not_found=${fromConfig.provider}/${fromConfig.id}`);
       await pushValidModels();
     } else {
-      const apiKey = await ctx.modelRegistry.getApiKey(configured);
-      if (apiKey) {
+      const auth = await resolveModelRequestAuth(ctx, configured);
+      if (auth.ok) {
         diagnostics.push(`selected=config:${configured.provider}/${configured.id}`);
-        return { model: configured, apiKey, diagnostics };
+        return { model: configured, auth: auth.auth, diagnostics };
       }
-      diagnostics.push(`config_model_api_key_missing=${configured.provider}/${configured.id}`);
+      diagnostics.push(`config_model_auth_unavailable=${configured.provider}/${configured.id}: ${auth.error}`);
       await pushValidModels();
     }
   } else {
@@ -828,12 +882,12 @@ async function pickReflectionModel(config: SelfLearningConfig, ctx: ExtensionCon
   }
 
   if (ctx.model) {
-    const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
-    if (apiKey) {
+    const auth = await resolveModelRequestAuth(ctx, ctx.model);
+    if (auth.ok) {
       diagnostics.push(`selected=current:${ctx.model.provider}/${ctx.model.id}`);
-      return { model: ctx.model, apiKey, diagnostics };
+      return { model: ctx.model, auth: auth.auth, diagnostics };
     }
-    diagnostics.push(`current_model_api_key_missing=${ctx.model.provider}/${ctx.model.id}`);
+    diagnostics.push(`current_model_auth_unavailable=${ctx.model.provider}/${ctx.model.id}: ${auth.error}`);
   } else {
     diagnostics.push("current_model=(none)");
   }
@@ -843,7 +897,7 @@ async function pickReflectionModel(config: SelfLearningConfig, ctx: ExtensionCon
 
 type RedistillModelCandidate = {
   model: NonNullable<ReturnType<typeof getModel>>;
-  apiKey: string;
+  auth: ModelRequestAuth;
   source: "configured" | "current";
 };
 
@@ -869,22 +923,22 @@ async function buildRedistillModelCandidates(config: SelfLearningConfig, ctx: Ex
 
     const registry = ctx.modelRegistry as unknown as {
       find?: (provider: string, id: string) => NonNullable<ReturnType<typeof getModel>> | undefined;
-      getAvailable?: () => Promise<Array<{ provider?: string; id?: string }>>;
+      getAvailable?: () => Array<{ provider?: string; id?: string }> | Promise<Array<{ provider?: string; id?: string }>>;
     };
 
     const model = registry.find?.(configured.provider, configured.id) ?? getModel(configured.provider, configured.id);
     if (model) {
-      const apiKey = await ctx.modelRegistry.getApiKey(model);
-      if (apiKey) {
+      const auth = await resolveModelRequestAuth(ctx, model);
+      if (auth.ok) {
         candidates.push({
           model,
-          apiKey,
+          auth: auth.auth,
           source: "configured",
         });
         diagnostics.push(`redistill_candidates=configured:${modelRef(model)}`);
         return { candidates, diagnostics };
       }
-      diagnostics.push(`configured.model_api_key_missing=${configured.provider}/${configured.id}`);
+      diagnostics.push(`configured.model_auth_unavailable=${configured.provider}/${configured.id}: ${auth.error}`);
     } else {
       diagnostics.push(`configured.model_not_found=${configured.provider}/${configured.id}`);
     }
@@ -904,17 +958,17 @@ async function buildRedistillModelCandidates(config: SelfLearningConfig, ctx: Ex
   }
 
   if (ctx.model) {
-    const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
-    if (apiKey) {
+    const auth = await resolveModelRequestAuth(ctx, ctx.model);
+    if (auth.ok) {
       candidates.push({
         model: ctx.model,
-        apiKey,
+        auth: auth.auth,
         source: "current",
       });
       diagnostics.push(`redistill_candidates=current:${modelRef(ctx.model)}`);
       return { candidates, diagnostics };
     }
-    diagnostics.push(`current_model_api_key_missing=${ctx.model.provider}/${ctx.model.id}`);
+    diagnostics.push(`current_model_auth_unavailable=${ctx.model.provider}/${ctx.model.id}: ${auth.error}`);
   } else {
     diagnostics.push("current_model=(none)");
   }
@@ -1323,7 +1377,7 @@ async function redistillCoreIndex(
   const modelSelection = await buildRedistillModelCandidates(config, ctx);
   if (modelSelection.candidates.length === 0) {
     throw new Error([
-      "No reflection model with API key available for redistill.",
+      "No reflection model with usable request auth available for redistill.",
       ...modelSelection.diagnostics,
     ].join("\n"));
   }
@@ -1391,7 +1445,7 @@ async function redistillCoreIndex(
                 },
               ],
             },
-            { apiKey: candidate.apiKey, maxTokens: REDISTILL_MODEL_MAX_TOKENS },
+            { apiKey: candidate.auth.apiKey, headers: candidate.auth.headers, maxTokens: REDISTILL_MODEL_MAX_TOKENS },
           ),
           redistillTimeoutMs(candidate.model, false),
           `Redistill model call failed at chunk ${currentChunk}/${totalChunks} (${processed}/${targets.length}) for ${candidateRef}`,
@@ -1450,7 +1504,7 @@ async function redistillCoreIndex(
                   },
                 ],
               },
-              { apiKey: candidate.apiKey, maxTokens: REDISTILL_REPAIR_MAX_TOKENS },
+              { apiKey: candidate.auth.apiKey, headers: candidate.auth.headers, maxTokens: REDISTILL_REPAIR_MAX_TOKENS },
             ),
             redistillTimeoutMs(candidate.model, true),
             `Redistill repair call failed at chunk ${currentChunk}/${totalChunks} (${processed}/${targets.length}) for ${candidateRef}`,
@@ -1777,7 +1831,7 @@ function describeReflectionSkipReason(reason: ReflectionSkipReason): string {
     case "empty_conversation":
       return "conversation serialization produced empty content";
     case "no_model":
-      return "no reflection model with an available API key could be resolved";
+      return "no reflection model with usable request auth could be resolved";
     case "empty_model_output":
       return "the model returned no text output for reflection";
     case "invalid_model_output":
@@ -1800,10 +1854,10 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
   const interruptionSignals = collectInterruptionSignals(ctx, Math.max(config.maxMessagesForReflection * 4, 24));
 
   const picked = await pickReflectionModel(config, ctx);
-  if (!picked.model || !picked.apiKey) {
+  if (!picked.model || !picked.auth) {
     return {
       reason: "no_model",
-      diagnostics: [...picked.diagnostics, "resolved_model=(none with available API key)"],
+      diagnostics: [...picked.diagnostics, "resolved_model=(none with usable request auth)"],
     };
   }
 
@@ -1831,7 +1885,7 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
           },
         ],
       },
-      { apiKey: picked.apiKey, maxTokens: 900 },
+      { apiKey: picked.auth.apiKey, headers: picked.auth.headers, maxTokens: 900 },
     ),
     REFLECTION_MODEL_TIMEOUT_MS,
     `Reflection model call failed for ${turnLabel}`,
@@ -1870,7 +1924,7 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
             },
           ],
         },
-        { apiKey: picked.apiKey, maxTokens: 900 },
+        { apiKey: picked.auth.apiKey, headers: picked.auth.headers, maxTokens: 900 },
       ),
       REFLECTION_REPAIR_TIMEOUT_MS,
       `Reflection repair call failed for ${turnLabel}`,
@@ -1935,7 +1989,7 @@ async function generateMonthSummary(
   );
 
   const picked = await pickReflectionModel(config, ctx);
-  if (!picked.model || !picked.apiKey) return { dailyCount: files.length };
+  if (!picked.model || !picked.auth) return { dailyCount: files.length };
 
   const response = await withTimeout(
     complete(
@@ -1949,7 +2003,7 @@ async function generateMonthSummary(
           },
         ],
       },
-      { apiKey: picked.apiKey, maxTokens: 2500 },
+      { apiKey: picked.auth.apiKey, headers: picked.auth.headers, maxTokens: 2500 },
     ),
     MONTH_SUMMARY_MODEL_TIMEOUT_MS,
     `Monthly summary model call failed for ${month}`,
@@ -2328,9 +2382,12 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const selectedApiKey = await ctx.modelRegistry.getApiKey(selectedModel);
-        if (!selectedApiKey) {
-          ctx.ui.notify(`No API key available for ${parsedFromSelection.provider}/${parsedFromSelection.id}`, "warning");
+        const selectedAuth = await resolveModelRequestAuth(ctx, selectedModel);
+        if (!selectedAuth.ok) {
+          ctx.ui.notify(
+            `Request auth unavailable for ${parsedFromSelection.provider}/${parsedFromSelection.id}: ${selectedAuth.error}`,
+            "warning",
+          );
         }
 
         pi.appendEntry(MODEL_ENTRY, {
@@ -2360,9 +2417,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const apiKey = await ctx.modelRegistry.getApiKey(exists);
-      if (!apiKey) {
-        ctx.ui.notify(`No API key available for ${parsed.provider}/${parsed.id}`, "warning");
+      const auth = await resolveModelRequestAuth(ctx, exists);
+      if (!auth.ok) {
+        ctx.ui.notify(`Request auth unavailable for ${parsed.provider}/${parsed.id}: ${auth.error}`, "warning");
       }
 
       pi.appendEntry(MODEL_ENTRY, { provider: parsed.provider, id: parsed.id, ts: Date.now() });
@@ -2408,9 +2465,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const apiKey = await ctx.modelRegistry.getApiKey(model);
-      if (!apiKey) {
-        ctx.ui.notify(`No API key available for ${parsed.provider}/${parsed.id}`, "warning");
+      const auth = await resolveModelRequestAuth(ctx, model);
+      if (!auth.ok) {
+        ctx.ui.notify(`Request auth unavailable for ${parsed.provider}/${parsed.id}: ${auth.error}`, "warning");
       }
 
       upsertModelInSettings(path, parsed);
@@ -2454,8 +2511,8 @@ export default function (pi: ExtensionAPI) {
         if (!model) {
           configModelStatus = "configured but not found in model registry";
         } else {
-          const apiKey = await ctx.modelRegistry.getApiKey(model);
-          configModelStatus = apiKey ? "configured and API key available" : "configured but API key missing";
+          const auth = await resolveModelRequestAuth(ctx, model);
+          configModelStatus = auth.ok ? "configured and request auth resolved" : "configured but request auth unavailable";
         }
       }
 
