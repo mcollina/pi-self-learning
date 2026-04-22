@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents like Claude Code (claude.ai/code
 
 - This repo is a **single pi extension package** (`pi-self-learning`).
 - Runtime logic is concentrated in **`extensions/self-learning.ts`**.
-- The extension implements a reflection loop: analyze recent conversation after completed agent tasks for mistakes/fixes, persist learnings to markdown/json files, optionally commit to a dedicated memory git repo, and inject memory back into future prompts.
+- The extension implements a reflection loop: analyze recent conversation after completed agent tasks for reusable strategies, mistakes, and fixes, persist learnings to markdown/json files, optionally commit to a dedicated memory git repo, and inject targeted memory back into future prompts.
 
 ## Common commands in this repo
 
@@ -44,6 +44,7 @@ Place that in project `.pi/settings.json`.
 - Validate behavior manually inside pi via extension commands:
   - `/learning-now`
   - `/learning-status`
+  - `/learning-retrieve-debug`
   - `/learning-month [YYYY-MM]`
   - `/learning-redistill [limit] [--dry-run] [--yes]` (when validating global-memory migration behavior)
 
@@ -81,14 +82,16 @@ On `agent_end` (when enabled and `autoAfterTask`):
 1. collect recent branch messages (`maxMessagesForReflection`) and interruption signals (blocked commands, permission denials, user abort/esc interrupts)
 2. serialize conversation to text
 3. run LLM reflection prompt expecting strict JSON:
+   - strategies
    - mistakes
    - fixes
+   - optional outcome (`success|failure|blocked|interrupted|mixed`)
    - scope-aware wording:
      - `storage.mode=project`: keep project-specific detail when useful
      - `storage.mode=global`: distill to cross-project reusable actions (avoid repo-specific identifiers)
 4. append markdown entry to `daily/YYYY-MM-DD.md`
-5. update durable memory:
-   - `core/index.json` (scored records)
+5. promote high-signal items into durable memory:
+   - `core/index.json` (scored records + retrieval/apply metadata)
    - `core/CORE.md` (top-ranked render)
    - `long-term-memory.md` (complete learnings history)
 6. optionally auto-commit changes in memory repo
@@ -117,14 +120,16 @@ If git is enabled, the extension initializes a repo in the memory root and commi
 Durable learnings are tracked in `core/index.json` records:
 
 - normalized key
-- kind: `learning` or `antiPattern`
+- kind: `strategy`, `learning`, or `antiPattern`
 - hits, score, firstSeen, lastSeen
+- optional metadata such as outcome, storage mode, source daily files, tool names, retrieval/apply counters
 
 Ranking favors:
 
 - higher score/hits
 - recency (with light time decay)
-- balanced representation in `CORE.md` (learnings + watch-outs each get reserved slots when both exist)
+- lightweight feedback from retrieval/apply counters
+- balanced representation in `CORE.md` (strategies + learnings + watch-outs)
 
 `CORE.md` is rendered from this ranked index (do not treat `CORE.md` as the only source of truth).
 
@@ -133,12 +138,13 @@ Ranking favors:
 On `before_agent_start`, extension can inject:
 
 - recent in-memory runtime notes (`injectLastN`)
-- bundled memory files (`core`, optional latest monthly, optional last N daily)
+- targeted retrieved durable memory from `core/index.json`
+- bundled memory files (`core`, optional latest monthly, optional last N daily) as fallback
 - optional system prompt memory policy (`instructionMode`: off/advisory/strict)
 
 Important path rule: injected headings and memory-policy instructions must reference the resolved memory file paths under the actual memory root, not synthetic `core/CORE.md` paths relative to the agent's current cwd. In project mode, resolve relative storage paths from the nearest ancestor `.pi/settings.json` (or nearest git root if no project settings file exists).
 
-Keep this flow intact when editing; it is how historical memory influences future turns.
+Keep this flow intact when editing; it is how historical memory influences future turns. Retrieval is intentionally best-effort and must not block agent startup.
 
 ### 6) Model resolution for reflections
 
@@ -168,6 +174,7 @@ Implemented in `self-learning.ts`:
 - `/learning-model <provider/id> | reset`
 - `/learning-model-global <provider/id> | reset | show`
 - `/learning-daily`
+- `/learning-retrieve-debug`
 - `/learning-status`
 
 When adding or changing behavior, update command descriptions and `README.md` in the same change.

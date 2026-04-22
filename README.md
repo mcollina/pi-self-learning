@@ -3,21 +3,23 @@
 A [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) extension that keeps a **git-backed memory** of each session:
 
 - automatic task-level reflections
+- targeted memory retrieval before future tasks
 - daily logs
 - monthly summaries
-- a durable **core learnings** file
+- a durable **core learnings** file with strategies, learnings, and watch-outs
 - configurable summarization model (branch-level and global)
 
 ## What it does
 
 After each completed agent task (when enabled), it:
-1. extracts what went wrong and how it was fixed,
+1. extracts reusable strategies, what went wrong, and how it was fixed,
    - including interruption signals such as blocked commands, permission denials, and user aborts (Esc/interrupt) as intent boundaries to analyze,
 2. appends the entry to a daily markdown file,
-3. updates `core/CORE.md` with top-ranked durable learnings (balanced across learnings + watch-outs),
-4. writes full history to `long-term-memory.md`,
-5. maintains a scored `core/index.json` (frequency + recency),
-6. commits changes in a dedicated memory git repository.
+3. promotes high-signal items into durable memory with a lightweight promotion gate,
+4. updates `core/CORE.md` with top-ranked durable memory (balanced across strategies + learnings + watch-outs),
+5. writes full history to `long-term-memory.md`,
+6. maintains a scored `core/index.json` (frequency + recency + retrieval/apply feedback),
+7. commits changes in a dedicated memory git repository.
 
 ## Memory folder layout
 
@@ -95,6 +97,35 @@ Project `.pi/settings.json`:
       "maxChars": 12000,
       "instructionMode": "strict"
     },
+    "reflection": {
+      "includeStrategies": true,
+      "maxStrategies": 3,
+      "promotion": {
+        "enabled": true,
+        "minLength": 24,
+        "requireActionVerb": true,
+        "rejectGeneric": true,
+        "maxPromotedPerReflection": 6
+      }
+    },
+    "retrieval": {
+      "enabled": true,
+      "mode": "hybrid+rerank",
+      "topK": 4,
+      "maxCandidates": 32,
+      "minScore": 0.18,
+      "maxChars": 5000,
+      "includeCoreFallback": true,
+      "includeRuntimeNotesInQuery": true,
+      "includeRecentMessagesInQuery": 4,
+      "trackUsage": true,
+      "scoreWeights": {
+        "lexical": 0.45,
+        "rank": 0.3,
+        "recency": 0.15,
+        "scope": 0.1
+      }
+    },
     "model": {
       "provider": "google",
       "id": "gemini-2.5-flash"
@@ -124,7 +155,23 @@ If you already have legacy global entries with project-specific wording, run:
 
 ## Loading memory into context
 
-Use `selfLearning.context` to inject memory into each turn:
+Use `selfLearning.context` and `selfLearning.retrieval` to inject memory into each turn.
+
+The extension now prefers **targeted retrieval** from `core/index.json` before falling back to broader memory bundles.
+
+### Retrieval
+
+- `retrieval.enabled`: enable targeted retrieval
+- `retrieval.mode`:
+  - `off`: disable retrieval
+  - `hybrid`: lexical overlap + durable ranking + recency/scope weights
+  - `hybrid+rerank`: same as `hybrid`, then optional model reranking on top candidates
+- `retrieval.topK`: how many memory items to inject
+- `retrieval.maxCandidates`: maximum durable candidates to score before selection
+- `retrieval.includeCoreFallback`: if retrieval finds nothing strong enough, fall back to the regular bundled memory files
+- `retrieval.trackUsage`: track retrieval and approximate later application in `core/index.json`
+
+### Bundle fallback
 
 - `includeCore`: inject the resolved `CORE.md` under the configured memory root (enabled by default)
 - `includeLatestMonthly`: inject the latest resolved `monthly/YYYY-MM.md` file (disabled by default)
@@ -148,6 +195,7 @@ With `instructionMode: "strict"`, the extension appends policy telling the assis
 - `/learning-month [YYYY-MM]` → generate monthly summary
 - `/learning-redistill [limit] [--dry-run] [--yes]` → re-distill existing core memory into cross-project rules (global mode)
 - `/learning-daily` → show today’s daily file path
+- `/learning-retrieve-debug` → inspect targeted retrieval query, scores, and selected items
 - `/learning-toggle` → enable/disable for current branch
 - `/learning-model` → open model selector (available models)
 - `/learning-model <provider/id> | reset` → set/reset branch model override
@@ -156,7 +204,8 @@ With `instructionMode: "strict"`, the extension appends policy telling the assis
 
 ## Notes
 
-- Reflection errors are non-blocking.
+- Reflection and retrieval errors are non-blocking.
 - If the configured model cannot resolve request auth (or the session model fallback cannot), reflection is skipped gracefully.
 - During reflection, blocked/denied/cancelled execution signals are treated as meaningful user intent and should produce preventive learnings when present.
+- Durable memory now separates reusable strategies, learnings, and watch-outs.
 - Memory repo commits are automatic after each memory update (if enabled).

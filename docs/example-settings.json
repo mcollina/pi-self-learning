@@ -1,7 +1,7 @@
 {
   "selfLearning": {
     "enabled": true,
-    "autoAfterTurn": true,
+    "autoAfterTask": true,
     "injectLastN": 5,
     "maxMessagesForReflection": 8,
     "maxLearnings": 8,
@@ -22,6 +22,35 @@
       "includeLastNDaily": 0,
       "maxChars": 12000,
       "instructionMode": "strict"
+    },
+    "reflection": {
+      "includeStrategies": true,
+      "maxStrategies": 3,
+      "promotion": {
+        "enabled": true,
+        "minLength": 24,
+        "requireActionVerb": true,
+        "rejectGeneric": true,
+        "maxPromotedPerReflection": 6
+      }
+    },
+    "retrieval": {
+      "enabled": true,
+      "mode": "hybrid+rerank",
+      "topK": 4,
+      "maxCandidates": 32,
+      "minScore": 0.18,
+      "maxChars": 5000,
+      "includeCoreFallback": true,
+      "includeRuntimeNotesInQuery": true,
+      "includeRecentMessagesInQuery": 4,
+      "trackUsage": true,
+      "scoreWeights": {
+        "lexical": 0.45,
+        "rank": 0.3,
+        "recency": 0.15,
+        "scope": 0.1
+      }
     },
     "model": {
       "provider": "google",
