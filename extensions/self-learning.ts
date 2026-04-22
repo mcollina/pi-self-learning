@@ -25,6 +25,41 @@ type ModelRequestAuth = {
   headers?: Record<string, string>;
 };
 
+type ReflectionOutcome = "success" | "failure" | "blocked" | "interrupted" | "mixed";
+
+type PromotionConfig = {
+  enabled: boolean;
+  minLength: number;
+  requireActionVerb: boolean;
+  rejectGeneric: boolean;
+  maxPromotedPerReflection: number;
+};
+
+type ReflectionConfig = {
+  includeStrategies: boolean;
+  maxStrategies: number;
+  promotion: PromotionConfig;
+};
+
+type RetrievalConfig = {
+  enabled: boolean;
+  mode: "off" | "hybrid" | "hybrid+rerank";
+  topK: number;
+  maxCandidates: number;
+  minScore: number;
+  maxChars: number;
+  includeCoreFallback: boolean;
+  includeRuntimeNotesInQuery: boolean;
+  includeRecentMessagesInQuery: number;
+  trackUsage: boolean;
+  scoreWeights: {
+    lexical: number;
+    rank: number;
+    recency: number;
+    scope: number;
+  };
+};
+
 type SelfLearningConfig = {
   enabled: boolean;
   autoAfterTask: boolean;
@@ -50,6 +85,8 @@ type SelfLearningConfig = {
     maxChars: number;
     instructionMode: "off" | "advisory" | "strict";
   };
+  reflection: ReflectionConfig;
+  retrieval: RetrievalConfig;
   model?:
     | {
         provider?: string;
@@ -59,8 +96,10 @@ type SelfLearningConfig = {
 };
 
 type LearningReflection = {
+  strategies: string[];
   mistakes: string[];
   fixes: string[];
+  outcome?: ReflectionOutcome;
 };
 
 type ReflectionSkipReason =
@@ -110,11 +149,41 @@ const DEFAULT_CONFIG: SelfLearningConfig = {
     maxChars: 12000,
     instructionMode: "strict",
   },
+  reflection: {
+    includeStrategies: true,
+    maxStrategies: 3,
+    promotion: {
+      enabled: true,
+      minLength: 24,
+      requireActionVerb: true,
+      rejectGeneric: true,
+      maxPromotedPerReflection: 6,
+    },
+  },
+  retrieval: {
+    enabled: true,
+    mode: "hybrid+rerank",
+    topK: 4,
+    maxCandidates: 32,
+    minScore: 0.18,
+    maxChars: 5000,
+    includeCoreFallback: true,
+    includeRuntimeNotesInQuery: true,
+    includeRecentMessagesInQuery: 4,
+    trackUsage: true,
+    scoreWeights: {
+      lexical: 0.45,
+      rank: 0.3,
+      recency: 0.15,
+      scope: 0.1,
+    },
+  },
 };
 
 const TOGGLE_ENTRY = "self-learning:toggle";
 const MODEL_ENTRY = "self-learning:model";
 const RUNTIME_NOTES: string[] = [];
+const LAST_RETRIEVED = new Map<string, { at: string; keys: string[] }>();
 const REDISTILL_CHUNK_SIZE = 8;
 const REDISTILL_MODEL_TIMEOUT_MS = 45_000;
 const REDISTILL_REPAIR_TIMEOUT_MS = 30_000;
@@ -132,6 +201,45 @@ const BLOCKED_COMMAND_PATTERN =
 const PERMISSION_DENIED_PATTERN =
   /\b(permission denied|operation not permitted|eacces|eperm|unauthorized|access denied|permission\s+negated)\b/i;
 const USER_CANCEL_PATTERN = /\b(cancelled by user|canceled by user|aborted by user|user cancelled|user canceled)\b/i;
+const GENERIC_LEARNING_PATTERN =
+  /^(be careful|be cautious|pay attention|double check|check carefully|think carefully|be more careful)\b/i;
+const ACTION_VERB_PATTERN =
+  /\b(validate|verify|check|confirm|inspect|compare|update|run|capture|distinguish|prefer|avoid|resolve|audit|document|synchronize|mirror|extract|convert|extend|evaluate|search|review|reproduce|re-run|rerun|test|trace|record|summarize|inject|promote|dedupe|gate|rank|retrieve|fallback|guard|ensure)\b/i;
+const RETRIEVAL_STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "for",
+  "from",
+  "how",
+  "i",
+  "if",
+  "in",
+  "into",
+  "is",
+  "it",
+  "its",
+  "of",
+  "on",
+  "or",
+  "that",
+  "the",
+  "their",
+  "then",
+  "there",
+  "this",
+  "to",
+  "use",
+  "when",
+  "with",
+  "you",
+  "your",
+]);
 let skipAutoReflectionUntil = 0;
 
 function isPlainObject(value: unknown): value is JsonObject {
@@ -312,7 +420,21 @@ function ensureCoreFile(root: string): string {
   if (!existsSync(file)) {
     writeFileSync(
       file,
-      "# Core Learnings\n\nMost important durable learnings collected over time.\n\n## Learnings\n- (none yet)\n",
+      [
+        "# Core Learnings",
+        "",
+        "Most important durable learnings collected over time.",
+        "",
+        "## High-value strategies",
+        "- (none yet)",
+        "",
+        "## High-value learnings",
+        "- (none yet)",
+        "",
+        "## Watch-outs",
+        "- (none yet)",
+        "",
+      ].join("\n"),
       "utf-8",
     );
   }
@@ -341,6 +463,7 @@ function parseReflection(raw: string): LearningReflection | undefined {
         ? value.filter((v): v is string => typeof v === "string").map((v) => v.trim()).filter(Boolean)
         : [];
 
+    const strategies = list(parsed.strategies);
     const mistakes = list(parsed.mistakes);
     const fixes = list(parsed.fixes);
 
@@ -350,12 +473,27 @@ function parseReflection(raw: string): LearningReflection | undefined {
 
     const normalizedMistakes = mistakes.length > 0 ? mistakes : fallbackMistakes;
     const normalizedFixes = fixes.length > 0 ? fixes : fallbackFixes;
+    const normalizedStrategies = strategies;
 
-    if (normalizedMistakes.length === 0 && normalizedFixes.length === 0) return undefined;
+    const outcomeRaw = typeof parsed.outcome === "string" ? parsed.outcome.trim().toLowerCase() : "";
+    const outcome =
+      outcomeRaw === "success" ||
+      outcomeRaw === "failure" ||
+      outcomeRaw === "blocked" ||
+      outcomeRaw === "interrupted" ||
+      outcomeRaw === "mixed"
+        ? (outcomeRaw as ReflectionOutcome)
+        : undefined;
+
+    if (normalizedStrategies.length === 0 && normalizedMistakes.length === 0 && normalizedFixes.length === 0) {
+      return undefined;
+    }
 
     return {
+      strategies: normalizedStrategies,
       mistakes: normalizedMistakes,
       fixes: normalizedFixes,
+      outcome,
     };
   } catch {
     return undefined;
@@ -420,9 +558,9 @@ function buildReflectionRepairPrompt(rawModelOutput: string): string {
   return [
     "Convert the following model output into STRICT JSON only.",
     "Return exactly one JSON object with this schema:",
-    '{"mistakes":["..."],"fixes":["..."]}',
+    '{"strategies":["..."],"mistakes":["..."],"fixes":["..."],"outcome":"success|failure|blocked|interrupted|mixed"}',
     "Do not add markdown fences. Do not add commentary.",
-    "If information is missing, use empty arrays.",
+    "If information is missing, use empty arrays and omit outcome or set it to 'mixed'.",
     "",
     "<raw_output>",
     compactText(rawModelOutput, 6000),
@@ -531,6 +669,7 @@ function collectInterruptionSignals(ctx: ExtensionContext, maxEntriesToScan: num
 function buildReflectionPrompt(
   conversationText: string,
   maxLearnings: number,
+  maxStrategies: number,
   storageMode: SelfLearningConfig["storage"]["mode"],
   interruptionSignals: string[] = [],
 ): string {
@@ -559,15 +698,21 @@ function buildReflectionPrompt(
       : [];
 
   return [
-    "You are a coding session mistake-prevention reflection engine.",
-    "Focus on what went wrong and how it was fixed.",
-    "Do NOT summarize accomplishments or completed tasks.",
+    "You are a coding session reflection engine for reusable strategies and mistake prevention.",
+    "Extract what worked well, what went wrong, and how it was fixed.",
+    "Do NOT summarize accomplishments as progress updates.",
     "Return STRICT JSON only with this schema:",
-    '{"mistakes":["..."],"fixes":["..."]}',
+    '{"strategies":["..."],"mistakes":["..."],"fixes":["..."],"outcome":"success|failure|blocked|interrupted|mixed"}',
     "Rules:",
-    `- Keep each array short (max ${maxLearnings}).`,
+    `- Keep 'strategies' short (max ${maxStrategies}).`,
+    `- Keep 'mistakes' short (max ${maxLearnings}).`,
+    `- Keep 'fixes' short (max ${maxLearnings}).`,
     "- Prefer specific, actionable, prevention-oriented points.",
     "- Avoid generic statements and progress summaries.",
+    "- 'strategies' should capture reusable behaviors that worked well and would help on similar tasks.",
+    "- 'mistakes' should capture preventable failure patterns.",
+    "- 'fixes' should capture concrete corrective actions.",
+    "- 'outcome' must be one of: success, failure, blocked, interrupted, mixed.",
     ...scopeRules,
     ...interruptionRules,
     "",
@@ -578,7 +723,7 @@ function buildReflectionPrompt(
   ].join("\n");
 }
 
-function buildRedistillPrompt(items: Array<{ id: number; kind: "learning" | "antiPattern"; text: string }>): string {
+function buildRedistillPrompt(items: Array<{ id: number; kind: CoreKind; text: string }>): string {
   return [
     "Rewrite the memory entries into concise, cross-project action rules.",
     "Return STRICT JSON only.",
@@ -591,7 +736,7 @@ function buildRedistillPrompt(items: Array<{ id: number; kind: "learning" | "ant
     "- Rewrite into generic actions that are reusable across repositories.",
     "- Keep each output as one concise sentence in imperative style.",
     "- For antiPattern items, output MUST start with 'Avoid:'.",
-    "- For learning items, output MUST NOT start with 'Avoid:'.",
+    "- For strategy and learning items, output MUST NOT start with 'Avoid:'.",
     "",
     "<items>",
     JSON.stringify(items),
@@ -630,7 +775,7 @@ function parseRedistillOutput(raw: string): Map<number, string> | undefined {
 
 function buildRedistillRepairPrompt(
   rawModelOutput: string,
-  items: Array<{ id: number; kind: "learning" | "antiPattern"; text: string }>,
+  items: Array<{ id: number; kind: CoreKind; text: string }>,
 ): string {
   return [
     "Convert the following model output into STRICT JSON only.",
@@ -639,7 +784,7 @@ function buildRedistillRepairPrompt(
     "Requirements:",
     "- Keep exactly one output item per input id.",
     "- For antiPattern items, text MUST start with 'Avoid:'.",
-    "- For learning items, text MUST NOT start with 'Avoid:'.",
+    "- For strategy and learning items, text MUST NOT start with 'Avoid:'.",
     "- No markdown fences. No commentary.",
     "",
     "<input_items>",
@@ -672,6 +817,11 @@ function buildMarkdownEntry(when: Date, turnLabel: string, reflection: LearningR
   lines.push(`## ${toTimeUTC(when)} — ${turnLabel}`);
   lines.push("");
 
+  lines.push("### Reusable strategies");
+  if (reflection.strategies.length === 0) lines.push("- (none)");
+  for (const item of reflection.strategies) lines.push(`- ${item}`);
+  lines.push("");
+
   lines.push("### What went wrong");
   if (reflection.mistakes.length === 0) lines.push("- (none)");
   for (const item of reflection.mistakes) lines.push(`- ${item}`);
@@ -680,6 +830,10 @@ function buildMarkdownEntry(when: Date, turnLabel: string, reflection: LearningR
   lines.push("### How it was fixed");
   if (reflection.fixes.length === 0) lines.push("- (none)");
   for (const item of reflection.fixes) lines.push(`- ${item}`);
+  lines.push("");
+
+  lines.push("### Outcome");
+  lines.push(`- ${reflection.outcome || "mixed"}`);
   lines.push("", "");
 
   return lines.join("\n");
@@ -1056,7 +1210,7 @@ function gitCommit(root: string, files: string[], message: string, config: SelfL
   runGit(root, ["commit", "-m", message], GIT_COMMIT_TIMEOUT_MS);
 }
 
-type CoreKind = "learning" | "antiPattern";
+type CoreKind = "strategy" | "learning" | "antiPattern";
 
 type CoreIndexRecord = {
   key: string;
@@ -1066,12 +1220,47 @@ type CoreIndexRecord = {
   score: number;
   firstSeen: string;
   lastSeen: string;
+  outcome?: ReflectionOutcome;
+  storageMode?: SelfLearningConfig["storage"]["mode"];
+  source?: "reflection" | "redistill" | "migration";
+  sourceDailyFiles?: string[];
+  toolNames?: string[];
+  retrievedCount?: number;
+  appliedCount?: number;
+  lastRetrievedAt?: string;
+  lastAppliedAt?: string;
 };
 
 type CoreIndex = {
-  version: 1;
+  version: 2;
   updatedAt: string;
   items: CoreIndexRecord[];
+};
+
+type DurableCandidate = {
+  text: string;
+  kind: CoreKind;
+  outcome?: ReflectionOutcome;
+  storageMode: SelfLearningConfig["storage"]["mode"];
+  sourceDailyFiles: string[];
+  toolNames: string[];
+};
+
+type RetrievalQuery = {
+  raw: string;
+  terms: string[];
+};
+
+type RetrievedMemory = {
+  item: CoreIndexRecord;
+  score: number;
+  reasons: string[];
+  subscores: {
+    lexical: number;
+    rank: number;
+    recency: number;
+    scope: number;
+  };
 };
 
 type RedistillCoreResult = {
@@ -1130,16 +1319,39 @@ function loadCoreIndex(root: string): CoreIndex {
           .map((it) => ({
             key: String(it.key || ""),
             text: String(it.text || "").trim(),
-            kind: it.kind === "antiPattern" ? "antiPattern" : "learning",
+            kind:
+              it.kind === "antiPattern"
+                ? ("antiPattern" as const)
+                : it.kind === "strategy"
+                  ? ("strategy" as const)
+                  : ("learning" as const),
             hits: Number.isFinite(Number(it.hits)) ? Number(it.hits) : 1,
             score: Number.isFinite(Number(it.score)) ? Number(it.score) : 1,
             firstSeen: String(it.firstSeen || new Date().toISOString()),
             lastSeen: String(it.lastSeen || new Date().toISOString()),
+            outcome:
+              it.outcome === "success" ||
+              it.outcome === "failure" ||
+              it.outcome === "blocked" ||
+              it.outcome === "interrupted" ||
+              it.outcome === "mixed"
+                ? (it.outcome as ReflectionOutcome)
+                : undefined,
+            storageMode: it.storageMode === "global" ? "global" : it.storageMode === "project" ? "project" : undefined,
+            source: it.source === "redistill" ? "redistill" : it.source === "migration" ? "migration" : "reflection",
+            sourceDailyFiles: Array.isArray(it.sourceDailyFiles)
+              ? it.sourceDailyFiles.filter((v): v is string => typeof v === "string")
+              : undefined,
+            toolNames: Array.isArray(it.toolNames) ? it.toolNames.filter((v): v is string => typeof v === "string") : undefined,
+            retrievedCount: Number.isFinite(Number(it.retrievedCount)) ? Number(it.retrievedCount) : 0,
+            appliedCount: Number.isFinite(Number(it.appliedCount)) ? Number(it.appliedCount) : 0,
+            lastRetrievedAt: typeof it.lastRetrievedAt === "string" ? it.lastRetrievedAt : undefined,
+            lastAppliedAt: typeof it.lastAppliedAt === "string" ? it.lastAppliedAt : undefined,
           }))
           .filter((it) => it.key && it.text);
 
         return {
-          version: 1,
+          version: 2,
           updatedAt: String(parsed.updatedAt || new Date().toISOString()),
           items,
         };
@@ -1158,10 +1370,13 @@ function loadCoreIndex(root: string): CoreIndex {
     score: 1,
     firstSeen: new Date().toISOString(),
     lastSeen: new Date().toISOString(),
+    source: "migration" as const,
+    retrievedCount: 0,
+    appliedCount: 0,
   }));
 
   return {
-    version: 1,
+    version: 2,
     updatedAt: new Date().toISOString(),
     items: migrated,
   };
@@ -1178,7 +1393,9 @@ function effectiveScore(item: CoreIndexRecord): number {
   const ageMs = Date.now() - Date.parse(item.lastSeen);
   const ageDays = Number.isFinite(ageMs) && ageMs > 0 ? ageMs / (1000 * 60 * 60 * 24) : 0;
   const recencyPenalty = ageDays * 0.05;
-  return item.score - recencyPenalty;
+  const appliedBonus = Math.min(1.5, (item.appliedCount || 0) * 0.25);
+  const retrievedBonus = Math.min(0.5, (item.retrievedCount || 0) * 0.03);
+  return item.score + appliedBonus + retrievedBonus - recencyPenalty;
 }
 
 function sortedIndexItems(index: CoreIndex): CoreIndexRecord[] {
@@ -1193,28 +1410,41 @@ function sortedIndexItems(index: CoreIndex): CoreIndexRecord[] {
 function selectBalancedCoreItems(index: CoreIndex, maxItems: number): CoreIndexRecord[] {
   const limit = Math.max(1, maxItems);
   const sorted = sortedIndexItems(index);
-  const learnings = sorted.filter((x) => x.kind === "learning");
-  const antiPatterns = sorted.filter((x) => x.kind === "antiPattern");
+  const buckets = {
+    strategy: sorted.filter((x) => x.kind === "strategy"),
+    learning: sorted.filter((x) => x.kind === "learning"),
+    antiPattern: sorted.filter((x) => x.kind === "antiPattern"),
+  };
 
-  if (learnings.length === 0 || antiPatterns.length === 0) {
-    return sorted.slice(0, limit);
+  const nonEmptyBuckets = (Object.values(buckets) as CoreIndexRecord[][]).filter((items) => items.length > 0);
+  if (nonEmptyBuckets.length <= 1) return sorted.slice(0, limit);
+
+  const picked: CoreIndexRecord[] = [];
+  const used = new Set<string>();
+
+  for (const items of nonEmptyBuckets) {
+    const first = items[0];
+    if (first && !used.has(first.key) && picked.length < limit) {
+      picked.push(first);
+      used.add(first.key);
+    }
   }
 
-  const basePerKind = Math.max(1, Math.floor(limit / 2));
-  const pickedLearnings = learnings.slice(0, basePerKind);
-  const pickedAntiPatterns = antiPatterns.slice(0, basePerKind);
-
-  const picked = [...pickedLearnings, ...pickedAntiPatterns];
   if (picked.length >= limit) return picked.slice(0, limit);
 
-  const used = new Set(picked.map((item) => item.key));
-  const remainder = sorted.filter((item) => !used.has(item.key));
-  const needed = limit - picked.length;
-  return [...picked, ...remainder.slice(0, needed)];
+  for (const item of sorted) {
+    if (used.has(item.key)) continue;
+    picked.push(item);
+    used.add(item.key);
+    if (picked.length >= limit) break;
+  }
+
+  return picked;
 }
 
 function renderCoreFromIndex(root: string, index: CoreIndex, maxItems: number): string {
   const selected = selectBalancedCoreItems(index, maxItems);
+  const strategies = selected.filter((x) => x.kind === "strategy");
   const learnings = selected.filter((x) => x.kind === "learning");
   const antiPatterns = selected.filter((x) => x.kind === "antiPattern");
 
@@ -1228,6 +1458,9 @@ function renderCoreFromIndex(root: string, index: CoreIndex, maxItems: number): 
     "For the complete history, see long-term-memory.md.",
     "",
     "Ranked by frequency + recency (with light decay over time).",
+    "",
+    "## High-value strategies",
+    ...(strategies.length > 0 ? strategies.map((item) => `- ${item.text}`) : ["- (none yet)"]),
     "",
     "## High-value learnings",
     ...(learnings.length > 0 ? learnings.map((item) => `- ${item.text}`) : ["- (none yet)"]),
@@ -1246,6 +1479,7 @@ function renderCoreFromIndex(root: string, index: CoreIndex, maxItems: number): 
 
 function renderLongTermMemoryFromIndex(root: string, index: CoreIndex): string {
   const sorted = sortedIndexItems(index);
+  const strategies = sorted.filter((x) => x.kind === "strategy");
   const learnings = sorted.filter((x) => x.kind === "learning");
   const antiPatterns = sorted.filter((x) => x.kind === "antiPattern");
 
@@ -1254,6 +1488,9 @@ function renderLongTermMemoryFromIndex(root: string, index: CoreIndex): string {
     "",
     "Complete history of durable learnings and recurring mistakes.",
     `Last updated: ${new Date().toISOString()}`,
+    "",
+    "## All strategies",
+    ...(strategies.length > 0 ? strategies.map((item) => `- ${item.text}`) : ["- (none yet)"]),
     "",
     "## All learnings",
     ...(learnings.length > 0 ? learnings.map((item) => `- ${item.text}`) : ["- (none yet)"]),
@@ -1270,20 +1507,113 @@ function renderLongTermMemoryFromIndex(root: string, index: CoreIndex): string {
   return file;
 }
 
-function updateCoreFromReflection(root: string, reflection: LearningReflection, maxItems: number): string[] {
+function promoteBaseScore(kind: CoreKind): number {
+  switch (kind) {
+    case "strategy":
+      return 1.3;
+    case "antiPattern":
+      return 1.1;
+    default:
+      return 1;
+  }
+}
+
+function extractToolNamesFromReflection(reflection: LearningReflection): string[] {
+  const text = [
+    ...reflection.strategies,
+    ...reflection.mistakes,
+    ...reflection.fixes,
+  ].join(" ");
+  const matches = text.match(/\b([a-z][a-z0-9_-]{1,30})\b/gi) || [];
+  const commonToolish = new Set([
+    "bash",
+    "read",
+    "edit",
+    "write",
+    "git",
+    "rg",
+    "node",
+    "npm",
+    "python",
+    "gh",
+  ]);
+  return [...new Set(matches.map((m) => m.toLowerCase()).filter((m) => commonToolish.has(m)))];
+}
+
+function shouldPromoteCandidate(
+  candidate: DurableCandidate,
+  config: SelfLearningConfig,
+): boolean {
+  const promotion = config.reflection.promotion;
+  if (!promotion.enabled) return true;
+  if (candidate.text.length < promotion.minLength) return false;
+  if (promotion.rejectGeneric && GENERIC_LEARNING_PATTERN.test(candidate.text)) return false;
+  if (promotion.requireActionVerb && !ACTION_VERB_PATTERN.test(candidate.text)) return false;
+  if (config.storage.mode === "global" && /[/\\]|(?:^|\s)[\w./-]+\.[a-z0-9]{1,6}\b|`[^`]+`/.test(candidate.text)) return false;
+  return true;
+}
+
+function buildDurableCandidates(
+  reflection: LearningReflection,
+  config: SelfLearningConfig,
+  dailyFile: string,
+): DurableCandidate[] {
+  const toolNames = extractToolNamesFromReflection(reflection);
+  const storageMode = config.storage.mode;
+  return [
+    ...reflection.strategies.map((text) => ({
+      text,
+      kind: "strategy" as const,
+      outcome: reflection.outcome,
+      storageMode,
+      sourceDailyFiles: [dailyFile],
+      toolNames,
+    })),
+    ...reflection.fixes.map((text) => ({
+      text,
+      kind: "learning" as const,
+      outcome: reflection.outcome,
+      storageMode,
+      sourceDailyFiles: [dailyFile],
+      toolNames,
+    })),
+    ...reflection.mistakes.map((text) => ({
+      text: `Avoid: ${text}`,
+      kind: "antiPattern" as const,
+      outcome: reflection.outcome,
+      storageMode,
+      sourceDailyFiles: [dailyFile],
+      toolNames,
+    })),
+  ]
+    .map((entry) => ({ ...entry, text: normalizeLearningText(entry.text) }))
+    .filter((entry) => entry.text.length > 0);
+}
+
+function updateCoreFromReflection(
+  root: string,
+  reflection: LearningReflection,
+  maxItems: number,
+  config: SelfLearningConfig,
+  dailyFile: string,
+): string[] {
   const index = loadCoreIndex(root);
   const nowIso = new Date().toISOString();
-
-  const updates: Array<{ text: string; kind: CoreKind }> = [
-    ...reflection.fixes.map((text) => ({ text, kind: "learning" as const })),
-    ...reflection.mistakes.map((text) => ({ text: `Avoid: ${text}`, kind: "antiPattern" as const })),
-  ]
-    .map((entry) => ({ text: normalizeLearningText(entry.text), kind: entry.kind }))
-    .filter((entry) => entry.text.length > 0);
-
   const byKey = new Map(index.items.map((item) => [item.key, item]));
+  const seenCandidateKeys = new Set<string>();
+  const promotionLimit = Math.max(1, config.reflection.promotion.maxPromotedPerReflection || 6);
+  const candidates = buildDurableCandidates(reflection, config, dailyFile)
+    .filter((candidate, idx) => idx < promotionLimit * 2)
+    .filter((candidate) => shouldPromoteCandidate(candidate, config))
+    .filter((candidate) => {
+      const key = learningKey(candidate.text);
+      if (seenCandidateKeys.has(key)) return false;
+      seenCandidateKeys.add(key);
+      return true;
+    })
+    .slice(0, promotionLimit);
 
-  for (const entry of updates) {
+  for (const entry of candidates) {
     const key = learningKey(entry.text);
     const existing = byKey.get(key);
 
@@ -1293,9 +1623,16 @@ function updateCoreFromReflection(root: string, reflection: LearningReflection, 
         text: entry.text,
         kind: entry.kind,
         hits: 1,
-        score: 1,
+        score: promoteBaseScore(entry.kind),
         firstSeen: nowIso,
         lastSeen: nowIso,
+        outcome: entry.outcome,
+        storageMode: entry.storageMode,
+        source: "reflection",
+        sourceDailyFiles: [...entry.sourceDailyFiles],
+        toolNames: [...entry.toolNames],
+        retrievedCount: 0,
+        appliedCount: 0,
       });
       continue;
     }
@@ -1304,8 +1641,13 @@ function updateCoreFromReflection(root: string, reflection: LearningReflection, 
     existing.kind = entry.kind;
     existing.hits += 1;
     existing.lastSeen = nowIso;
+    existing.outcome = entry.outcome || existing.outcome;
+    existing.storageMode = entry.storageMode || existing.storageMode;
+    existing.source = existing.source || "reflection";
+    existing.sourceDailyFiles = [...new Set([...(existing.sourceDailyFiles || []), ...entry.sourceDailyFiles])].slice(-12);
+    existing.toolNames = [...new Set([...(existing.toolNames || []), ...entry.toolNames])].slice(0, 12);
 
-    const incrementBase = 1;
+    const incrementBase = promoteBaseScore(entry.kind);
     const repetitionBonus = Math.min(1, existing.hits * 0.08);
     existing.score += incrementBase + repetitionBonus;
   }
@@ -1331,6 +1673,18 @@ function mergeCoreRecords(items: CoreIndexRecord[]): CoreIndexRecord[] {
 
     existing.hits += item.hits;
     existing.score += item.score;
+    existing.retrievedCount = (existing.retrievedCount || 0) + (item.retrievedCount || 0);
+    existing.appliedCount = (existing.appliedCount || 0) + (item.appliedCount || 0);
+    existing.sourceDailyFiles = [...new Set([...(existing.sourceDailyFiles || []), ...(item.sourceDailyFiles || [])])].slice(-20);
+    existing.toolNames = [...new Set([...(existing.toolNames || []), ...(item.toolNames || [])])].slice(0, 20);
+    existing.lastRetrievedAt =
+      !existing.lastRetrievedAt || (item.lastRetrievedAt && Date.parse(item.lastRetrievedAt) > Date.parse(existing.lastRetrievedAt))
+        ? item.lastRetrievedAt || existing.lastRetrievedAt
+        : existing.lastRetrievedAt;
+    existing.lastAppliedAt =
+      !existing.lastAppliedAt || (item.lastAppliedAt && Date.parse(item.lastAppliedAt) > Date.parse(existing.lastAppliedAt))
+        ? item.lastAppliedAt || existing.lastAppliedAt
+        : existing.lastAppliedAt;
     if (Date.parse(item.firstSeen) < Date.parse(existing.firstSeen)) {
       existing.firstSeen = item.firstSeen;
     }
@@ -1338,6 +1692,9 @@ function mergeCoreRecords(items: CoreIndexRecord[]): CoreIndexRecord[] {
       existing.lastSeen = item.lastSeen;
       existing.text = item.text;
       existing.kind = item.kind;
+      existing.outcome = item.outcome || existing.outcome;
+      existing.storageMode = item.storageMode || existing.storageMode;
+      existing.source = item.source || existing.source;
     }
   }
 
@@ -1756,6 +2113,294 @@ function readTrimmedFile(file: string, maxChars: number): string {
   return compactText(raw, maxChars);
 }
 
+function tokenizeForRetrieval(text: string): string[] {
+  return normalizeLearningText(text)
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3)
+    .filter((token) => !RETRIEVAL_STOPWORDS.has(token));
+}
+
+function buildRetrievalQuery(ctx: ExtensionContext, config: SelfLearningConfig): RetrievalQuery {
+  const pieces: string[] = [];
+  const messages = getBranchMessages(ctx, Math.max(1, config.retrieval.includeRecentMessagesInQuery || 4));
+  if (messages.length > 0) {
+    const serialized = serializeConversation(convertToLlm(messages as any));
+    if (serialized.trim()) pieces.push(serialized.trim());
+  }
+
+  if (config.retrieval.includeRuntimeNotesInQuery && RUNTIME_NOTES.length > 0) {
+    pieces.push(RUNTIME_NOTES.slice(-Math.max(1, config.injectLastN || 5)).join("\n"));
+  }
+
+  pieces.push(`cwd=${ctx.cwd}`);
+
+  const raw = compactText(pieces.filter(Boolean).join("\n\n"), 4000);
+  return { raw, terms: tokenizeForRetrieval(raw) };
+}
+
+function lexicalSimilarity(query: RetrievalQuery, text: string): number {
+  const queryTerms = query.terms;
+  if (queryTerms.length === 0) return 0;
+  const itemTerms = tokenizeForRetrieval(text);
+  if (itemTerms.length === 0) return 0;
+
+  const itemSet = new Set(itemTerms);
+  const overlap = queryTerms.filter((term) => itemSet.has(term));
+  const coverage = overlap.length / Math.max(1, new Set(queryTerms).size);
+  const density = overlap.length / Math.max(1, itemSet.size);
+  return Math.min(1, coverage * 0.75 + density * 0.25);
+}
+
+function normalizedRankScore(item: CoreIndexRecord, index: CoreIndex): number {
+  const sorted = sortedIndexItems(index);
+  const best = sorted[0];
+  if (!best) return 0;
+  const bestScore = Math.max(0.0001, effectiveScore(best));
+  return Math.max(0, Math.min(1, effectiveScore(item) / bestScore));
+}
+
+function recencyBoostScore(item: CoreIndexRecord): number {
+  const ageMs = Date.now() - Date.parse(item.lastSeen);
+  const ageDays = Number.isFinite(ageMs) && ageMs > 0 ? ageMs / (1000 * 60 * 60 * 24) : 0;
+  return Math.max(0, 1 - ageDays / 45);
+}
+
+function scopeMatchScore(item: CoreIndexRecord, config: SelfLearningConfig): number {
+  if (!item.storageMode) return 0.5;
+  return item.storageMode === config.storage.mode ? 1 : 0.25;
+}
+
+function scoreRetrievedItem(item: CoreIndexRecord, index: CoreIndex, query: RetrievalQuery, config: SelfLearningConfig): RetrievedMemory {
+  const lexical = lexicalSimilarity(query, item.text);
+  const rank = normalizedRankScore(item, index);
+  const recency = recencyBoostScore(item);
+  const scope = scopeMatchScore(item, config);
+  const weights = config.retrieval.scoreWeights;
+  const score = lexical * weights.lexical + rank * weights.rank + recency * weights.recency + scope * weights.scope;
+  const reasons: string[] = [];
+  if (lexical > 0) reasons.push(`lexical overlap=${lexical.toFixed(2)}`);
+  if (item.kind === "strategy") reasons.push("strategy item");
+  if ((item.appliedCount || 0) > 0) reasons.push(`applied=${item.appliedCount}`);
+  if (scope >= 0.99) reasons.push(`scope=${config.storage.mode}`);
+
+  return {
+    item,
+    score,
+    reasons,
+    subscores: { lexical, rank, recency, scope },
+  };
+}
+
+async function rerankRetrievedMemories(
+  query: RetrievalQuery,
+  candidates: RetrievedMemory[],
+  config: SelfLearningConfig,
+  ctx: ExtensionContext,
+): Promise<RetrievedMemory[]> {
+  if (config.retrieval.mode !== "hybrid+rerank" || candidates.length <= 1) return candidates;
+
+  const picked = await pickReflectionModel(config, ctx);
+  if (!picked.model || !picked.auth) return candidates;
+
+  const payload = candidates.map((candidate, idx) => ({
+    id: idx + 1,
+    key: candidate.item.key,
+    kind: candidate.item.kind,
+    text: candidate.item.text,
+  }));
+
+  try {
+    const response = await withTimeout(
+      complete(
+        picked.model,
+        {
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: [
+                    "Select the memory items most relevant to the current coding task.",
+                    "Return STRICT JSON only with this schema:",
+                    '{"selected":[{"id":1,"reason":"..."}]}',
+                    "Prefer reusable strategies and preventions relevant to the query.",
+                    "",
+                    "<query>",
+                    query.raw,
+                    "</query>",
+                    "",
+                    "<candidates>",
+                    JSON.stringify(payload),
+                    "</candidates>",
+                  ].join("\n"),
+                },
+              ],
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        { apiKey: picked.auth.apiKey, headers: picked.auth.headers, maxTokens: 1200 },
+      ),
+      20_000,
+      "Retrieval rerank model call failed",
+    );
+
+    const raw = extractTextFromResponseContent(response.content);
+    const parsedRaw = raw ? stripCodeFence(raw) : "";
+    const parsed = parsedRaw ? JSON.parse(extractFirstJsonObject(parsedRaw) || parsedRaw) as unknown : undefined;
+    if (!isPlainObject(parsed) || !Array.isArray(parsed.selected)) return candidates;
+
+    const reasonById = new Map<number, string>();
+    const selectedIds: number[] = [];
+    for (const item of parsed.selected) {
+      if (!isPlainObject(item)) continue;
+      const id = Number(item.id);
+      const reason = typeof item.reason === "string" ? item.reason.trim() : "reranked by model";
+      if (Number.isFinite(id)) {
+        selectedIds.push(id);
+        reasonById.set(id, reason || "reranked by model");
+      }
+    }
+
+    const selectedSet = new Set(selectedIds);
+    const preferred = selectedIds
+      .map((id, idx) => {
+        const found = candidates[id - 1];
+        if (!found) return undefined;
+        const reason = reasonById.get(id) || "reranked by model";
+        return {
+          ...found,
+          score: found.score + Math.max(0.05, (selectedIds.length - idx) * 0.05),
+          reasons: [...found.reasons, `rerank: ${reason}`],
+        };
+      })
+      .filter((item): item is RetrievedMemory => Boolean(item));
+
+    const remainder = candidates.filter((_item, idx) => !selectedSet.has(idx + 1));
+    return [...preferred, ...remainder];
+  } catch {
+    return candidates;
+  }
+}
+
+function retrievalSessionKey(cwdOrRoot: string): string {
+  return resolveProjectBaseDir(cwdOrRoot);
+}
+
+function markRetrievedMemories(root: string, keys: string[]): void {
+  if (keys.length === 0 || !existsSync(coreIndexFile(root))) return;
+  try {
+    const index = loadCoreIndex(root);
+    const nowIso = new Date().toISOString();
+    let changed = false;
+    for (const item of index.items) {
+      if (!keys.includes(item.key)) continue;
+      item.retrievedCount = (item.retrievedCount || 0) + 1;
+      item.lastRetrievedAt = nowIso;
+      changed = true;
+    }
+    if (changed) {
+      index.updatedAt = nowIso;
+      saveCoreIndex(root, index);
+    }
+  } catch {
+    // best-effort only
+  }
+}
+
+function reflectionTextForUsage(reflection: LearningReflection): string {
+  return [...reflection.strategies, ...reflection.mistakes, ...reflection.fixes].join(" ").toLowerCase();
+}
+
+function noteAppliedRetrievedMemories(root: string, cwd: string, reflection: LearningReflection, maxItems: number): string[] {
+  const sessionKey = retrievalSessionKey(cwd);
+  const last = LAST_RETRIEVED.get(sessionKey);
+  if (!last || last.keys.length === 0 || !existsSync(coreIndexFile(root))) return [];
+
+  const reflectionText = reflectionTextForUsage(reflection);
+  if (!reflectionText.trim()) return [];
+
+  const index = loadCoreIndex(root);
+  const nowIso = new Date().toISOString();
+  let changed = false;
+
+  for (const item of index.items) {
+    if (!last.keys.includes(item.key)) continue;
+    const itemTerms = tokenizeForRetrieval(item.text);
+    const overlap = itemTerms.filter((term) => reflectionText.includes(term));
+    if (overlap.length === 0) continue;
+    item.appliedCount = (item.appliedCount || 0) + 1;
+    item.lastAppliedAt = nowIso;
+    changed = true;
+  }
+
+  LAST_RETRIEVED.delete(sessionKey);
+  if (!changed) return [];
+  index.updatedAt = nowIso;
+  const renderedCore = renderCoreFromIndex(root, index, Math.max(1, maxItems));
+  const longTermFile = renderLongTermMemoryFromIndex(root, index);
+  const indexFile = saveCoreIndex(root, index);
+  return [renderedCore, longTermFile, indexFile];
+}
+
+async function retrieveMemories(
+  root: string,
+  config: SelfLearningConfig,
+  ctx: ExtensionContext,
+): Promise<{ query: RetrievalQuery; candidates: RetrievedMemory[]; selected: RetrievedMemory[] } | undefined> {
+  if (!config.retrieval.enabled || config.retrieval.mode === "off") return undefined;
+  if (!existsSync(coreIndexFile(root))) return undefined;
+
+  const index = loadCoreIndex(root);
+  if (index.items.length === 0) return undefined;
+
+  const query = buildRetrievalQuery(ctx, config);
+  const candidates = sortedIndexItems(index)
+    .slice(0, Math.max(1, config.retrieval.maxCandidates || 32))
+    .map((item) => scoreRetrievedItem(item, index, query, config))
+    .filter((item) => item.score >= config.retrieval.minScore)
+    .sort((a, b) => b.score - a.score);
+
+  if (candidates.length === 0) return undefined;
+
+  const reranked = await rerankRetrievedMemories(query, candidates.slice(0, Math.max(config.retrieval.topK * 2, 8)), config, ctx);
+  const selected = reranked.slice(0, Math.max(1, config.retrieval.topK || 4));
+  if (selected.length === 0) return undefined;
+
+  return { query, candidates, selected };
+}
+
+async function buildRetrievedMemoryContextBundle(
+  root: string,
+  config: SelfLearningConfig,
+  ctx: ExtensionContext,
+): Promise<string | undefined> {
+  const retrieval = await retrieveMemories(root, config, ctx);
+  if (!retrieval) return undefined;
+
+  const maxChars = Math.max(1500, config.retrieval.maxChars || 5000);
+  const lines = [
+    "# Self-learning retrieved memory",
+    "Use this as targeted prior experience for the current task.",
+    `Resolved memory root: ${pathForPrompt(root, ctx.cwd)}`,
+    "",
+    "## Retrieved items",
+    ...retrieval.selected.flatMap((match) => [
+      `- [${match.item.kind} | score=${match.score.toFixed(2)}] ${match.item.text}`,
+      `  - Why matched: ${match.reasons.length > 0 ? match.reasons.join("; ") : "hybrid retrieval match"}`,
+    ]),
+  ];
+
+  const selectedKeys = retrieval.selected.map((match) => match.item.key);
+  LAST_RETRIEVED.set(retrievalSessionKey(ctx.cwd), { at: new Date().toISOString(), keys: selectedKeys });
+  if (config.retrieval.trackUsage) markRetrievedMemories(root, selectedKeys);
+
+  return compactText(lines.join("\n"), maxChars);
+}
+
 function buildMemoryContextBundle(root: string, config: SelfLearningConfig, cwd: string): string | undefined {
   const sections: string[] = [];
   const maxChars = Math.max(2000, config.context.maxChars || 12000);
@@ -1876,6 +2521,7 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
                 text: buildReflectionPrompt(
                   conversationText,
                   config.maxLearnings,
+                  config.reflection.includeStrategies ? Math.max(1, config.reflection.maxStrategies || 3) : 0,
                   config.storage.mode,
                   interruptionSignals,
                 ),
@@ -1951,17 +2597,24 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
     };
   }
 
+  if (!config.reflection.includeStrategies) {
+    parsed.strategies = [];
+  }
+
   const now = new Date();
   const entry = buildMarkdownEntry(now, turnLabel, parsed);
   const root = resolveStorageRoot(config, ctx.cwd);
   ensureGitRepo(root, config);
 
   const dailyFile = appendDailyEntry(root, now, entry);
-  const coreFiles = updateCoreFromReflection(root, parsed, Math.max(1, config.maxCoreItems || 20));
+  const coreFiles = updateCoreFromReflection(root, parsed, Math.max(1, config.maxCoreItems || 20), config, dailyFile);
+  const usageFiles = config.retrieval.trackUsage
+    ? noteAppliedRetrievedMemories(root, ctx.cwd, parsed, Math.max(1, config.maxCoreItems || 20))
+    : [];
 
-  gitCommit(root, [dailyFile, ...coreFiles], `chore(memory): ${toDateKeyUTC(now)} ${turnLabel.toLowerCase()}`, config);
+  gitCommit(root, [dailyFile, ...coreFiles, ...usageFiles], `chore(memory): ${toDateKeyUTC(now)} ${turnLabel.toLowerCase()}`, config);
 
-  const shortNote = (parsed.mistakes[0] || parsed.fixes[0] || "").slice(0, 180);
+  const shortNote = (parsed.strategies[0] || parsed.mistakes[0] || parsed.fixes[0] || "").slice(0, 180);
   if (shortNote) {
     RUNTIME_NOTES.push(shortNote);
     if (RUNTIME_NOTES.length > 30) RUNTIME_NOTES.splice(0, RUNTIME_NOTES.length - 30);
@@ -2064,8 +2717,13 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (config.context.enabled && root) {
-      const bundle = buildMemoryContextBundle(root, config, ctx.cwd);
-      if (bundle) pieces.push(bundle);
+      const retrievedBundle = await buildRetrievedMemoryContextBundle(root, config, ctx);
+      if (retrievedBundle) {
+        pieces.push(retrievedBundle);
+      } else if (config.retrieval.includeCoreFallback) {
+        const bundle = buildMemoryContextBundle(root, config, ctx.cwd);
+        if (bundle) pieces.push(bundle);
+      }
     }
 
     const instruction = config.context.enabled && root ? buildMemoryInstruction(config, root, ctx.cwd) : "";
@@ -2486,6 +3144,39 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("learning-retrieve-debug", {
+    description: "Show targeted memory retrieval details for the current task",
+    handler: async (_args, ctx) => {
+      const settings = loadMergedSettings(ctx.cwd);
+      const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
+      const root = resolveStorageRoot(config, ctx.cwd);
+
+      try {
+        const retrieval = await retrieveMemories(root, config, ctx);
+        if (!retrieval) {
+          ctx.ui.notify(`No retrieved memories for ${root}`, "warning");
+          return;
+        }
+
+        ctx.ui.notify(`Retrieval query:\n${compactText(retrieval.query.raw, 600)}`, "info");
+        const preview = retrieval.selected
+          .map(
+            (match, idx) =>
+              [
+                `${idx + 1}. [${match.item.kind}] score=${match.score.toFixed(2)} text=${compactText(match.item.text, 120)}`,
+                `   subscores: lexical=${match.subscores.lexical.toFixed(2)}, rank=${match.subscores.rank.toFixed(2)}, recency=${match.subscores.recency.toFixed(2)}, scope=${match.subscores.scope.toFixed(2)}`,
+                `   reasons: ${match.reasons.length > 0 ? match.reasons.join("; ") : "(none)"}`,
+              ].join("\n"),
+          )
+          .join("\n");
+        ctx.ui.notify(`Retrieved memories:\n${preview}`, "info");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`learning-retrieve-debug failed: ${message}`, "error");
+      }
+    },
+  });
+
   pi.registerCommand("learning-status", {
     description: "Show self-learning status and effective config",
     handler: async (_args, ctx) => {
@@ -2533,6 +3224,17 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`selfLearning.context.includeLastNDaily=${config.context.includeLastNDaily}`, "info");
       ctx.ui.notify(`selfLearning.context.maxChars=${config.context.maxChars}`, "info");
       ctx.ui.notify(`selfLearning.context.instructionMode=${config.context.instructionMode}`, "info");
+      ctx.ui.notify(`selfLearning.reflection.includeStrategies=${config.reflection.includeStrategies}`, "info");
+      ctx.ui.notify(`selfLearning.reflection.maxStrategies=${config.reflection.maxStrategies}`, "info");
+      ctx.ui.notify(`selfLearning.reflection.promotion.enabled=${config.reflection.promotion.enabled}`, "info");
+      ctx.ui.notify(`selfLearning.reflection.promotion.maxPromotedPerReflection=${config.reflection.promotion.maxPromotedPerReflection}`, "info");
+      ctx.ui.notify(`selfLearning.retrieval.enabled=${config.retrieval.enabled}`, "info");
+      ctx.ui.notify(`selfLearning.retrieval.mode=${config.retrieval.mode}`, "info");
+      ctx.ui.notify(`selfLearning.retrieval.topK=${config.retrieval.topK}`, "info");
+      ctx.ui.notify(`selfLearning.retrieval.maxCandidates=${config.retrieval.maxCandidates}`, "info");
+      ctx.ui.notify(`selfLearning.retrieval.minScore=${config.retrieval.minScore}`, "info");
+      ctx.ui.notify(`selfLearning.retrieval.includeCoreFallback=${config.retrieval.includeCoreFallback}`, "info");
+      ctx.ui.notify(`selfLearning.retrieval.trackUsage=${config.retrieval.trackUsage}`, "info");
       ctx.ui.notify(
         configModel
           ? `selfLearning.model=${configModel.provider}/${configModel.id} (configured)`
