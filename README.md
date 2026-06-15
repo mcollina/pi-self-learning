@@ -10,9 +10,10 @@ A [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) exte
 
 ## What it does
 
-After each completed agent task (when enabled), it:
+After each fully completed agent task (when enabled), it:
 1. extracts what went wrong and how it was fixed,
-   - including interruption signals such as blocked commands, permission denials, and user aborts (Esc/interrupt) as intent boundaries to analyze,
+   - including blocked commands and permission denials as operational constraints to analyze,
+   - skipping user-aborted/incomplete turns,
 2. appends the entry to a daily markdown file,
 3. updates `core/CORE.md` with top-ranked durable learnings (balanced across learnings + watch-outs),
 4. writes full history to `long-term-memory.md`,
@@ -107,7 +108,7 @@ Project `.pi/settings.json`:
 - global `~/.pi/agent/settings.json` (global default)
 - project `.pi/settings.json` (project override)
 
-`selfLearning.autoAfterTask` controls automatic reflection after each completed agent task.
+`selfLearning.autoAfterTask` controls automatic reflection after each fully completed agent task; user-aborted or otherwise incomplete turns are skipped.
 Legacy `selfLearning.autoAfterTurn` is still accepted for backward compatibility.
 
 Prompt scope depends on storage mode:
@@ -158,5 +159,5 @@ With `instructionMode: "strict"`, the extension appends policy telling the assis
 
 - Reflection errors are non-blocking.
 - If the configured model cannot resolve request auth (or the session model fallback cannot), reflection is skipped gracefully.
-- During reflection, blocked/denied/cancelled execution signals are treated as meaningful user intent and should produce preventive learnings when present.
+- During reflection, blocked/denied execution signals from completed turns are treated as constraints that should produce preventive learnings when present; user aborts are skipped as incomplete turns.
 - Memory repo commits are automatic after each memory update (if enabled).

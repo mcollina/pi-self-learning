@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents like Claude Code (claude.ai/code
 
 - This repo is a **single pi extension package** (`pi-self-learning`).
 - Runtime logic is concentrated in **`extensions/self-learning.ts`**.
-- The extension implements a reflection loop: analyze recent conversation after completed agent tasks for mistakes/fixes, persist learnings to markdown/json files, optionally commit to a dedicated memory git repo, and inject memory back into future prompts.
+- The extension implements a reflection loop: analyze recent conversation after fully completed agent tasks for mistakes/fixes, persist learnings to markdown/json files, optionally commit to a dedicated memory git repo, and inject memory back into future prompts.
 
 ## Common commands in this repo
 
@@ -76,9 +76,9 @@ Settings merge is deep for plain objects (`deepMerge`).
 
 ### 2) Task-end reflection pipeline
 
-On `agent_end` (when enabled and `autoAfterTask`):
+On `agent_end` (when enabled and `autoAfterTask`) after the final assistant message has `stopReason: "stop"`:
 
-1. collect recent branch messages (`maxMessagesForReflection`) and interruption signals (blocked commands, permission denials, user abort/esc interrupts)
+1. collect recent branch messages (`maxMessagesForReflection`) and execution-boundary signals (blocked commands, permission denials); skip user-aborted/incomplete messages
 2. serialize conversation to text
 3. run LLM reflection prompt expecting strict JSON:
    - mistakes
@@ -176,5 +176,5 @@ When adding or changing behavior, update command descriptions and `README.md` in
 
 - Keep timestamps/date partitioning in UTC (`toDateKeyUTC`, `toMonthKeyUTC`, `toTimeUTC`) unless migrating all readers/writers.
 - Preserve non-blocking behavior in turn hooks; extension should not break normal agent flow.
-- Preserve reflection handling for interruption signals (blocked tools, permission denials, user interrupts) as first-class learning inputs.
+- Preserve automatic reflection only after completed turns (`stopReason: "stop"`); treat blocked tools and permission denials as learning inputs, but skip user-aborted/incomplete turns.
 - If you change memory file formats (`daily`, `monthly`, `core/index.json`, `long-term-memory.md`), include migration/backward-compat handling in code.

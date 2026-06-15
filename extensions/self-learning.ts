@@ -126,7 +126,7 @@ const MONTH_SUMMARY_MODEL_TIMEOUT_MS = 120_000;
 const GIT_FAST_TIMEOUT_MS = 15_000;
 const GIT_COMMIT_TIMEOUT_MS = 30_000;
 const REDISTILL_SKIP_AUTO_REFLECTION_MS = 5 * 60_000;
-const INTERRUPTION_SIGNAL_MAX = 8;
+const EXECUTION_BOUNDARY_SIGNAL_MAX = 8;
 const BLOCKED_COMMAND_PATTERN =
   /\b(blocked|not allowed|forbidden|denied by|disallowed|policy|blocked by user|blocked by an extension|user denied|dangerous command|refused)\b/i;
 const PERMISSION_DENIED_PATTERN =
@@ -467,7 +467,32 @@ function extractMessageText(content: unknown): string {
     .trim();
 }
 
-function collectInterruptionSignals(ctx: ExtensionContext, maxEntriesToScan: number): string[] {
+function isUserAbortMessage(message: unknown): boolean {
+  if (!isPlainObject(message)) return false;
+
+  const role = typeof message.role === "string" ? message.role : "";
+  if (role === "assistant") return message.stopReason === "aborted";
+  if (role !== "toolResult") return false;
+
+  const text = extractMessageText(message.content);
+  return /skipped due to queued user message/i.test(text) || USER_CANCEL_PATTERN.test(text);
+}
+
+function latestAssistantStopReason(messages: unknown[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!isPlainObject(message) || message.role !== "assistant") continue;
+    return typeof message.stopReason === "string" ? message.stopReason : undefined;
+  }
+
+  return undefined;
+}
+
+function didCompleteFullTurn(messages: unknown[]): boolean {
+  return latestAssistantStopReason(messages) === "stop";
+}
+
+function collectExecutionBoundarySignals(ctx: ExtensionContext, maxEntriesToScan: number): string[] {
   const branch = ctx.sessionManager.getBranch() as SessionEntry[];
   if (branch.length === 0) return [];
 
@@ -488,14 +513,7 @@ function collectInterruptionSignals(ctx: ExtensionContext, maxEntriesToScan: num
     const message = entry.message as JsonObject;
     const role = typeof message.role === "string" ? message.role : "";
 
-    if (role === "assistant") {
-      const stopReason = typeof message.stopReason === "string" ? message.stopReason : "";
-      if (stopReason === "aborted") {
-        push("Assistant response was aborted/interrupted by the user (often Esc/abort). Treat this as an intent-change signal.");
-      }
-      continue;
-    }
-
+    if (role === "assistant") continue;
     if (role !== "toolResult") continue;
 
     const toolName = typeof message.toolName === "string" ? message.toolName : "(unknown tool)";
@@ -503,8 +521,7 @@ function collectInterruptionSignals(ctx: ExtensionContext, maxEntriesToScan: num
     const textPreview = compactText(text || "(no text)", 180).replace(/\s+/g, " ").trim();
     const isError = message.isError === true;
 
-    if (/skipped due to queued user message/i.test(text)) {
-      push(`Tool ${toolName} was skipped because the user interrupted and queued a new direction.`);
+    if (/skipped due to queued user message/i.test(text) || USER_CANCEL_PATTERN.test(text)) {
       continue;
     }
 
@@ -517,22 +534,17 @@ function collectInterruptionSignals(ctx: ExtensionContext, maxEntriesToScan: num
 
     if (BLOCKED_COMMAND_PATTERN.test(text)) {
       push(`Tool ${toolName} was blocked/denied by constraints: ${textPreview}`);
-      continue;
-    }
-
-    if (USER_CANCEL_PATTERN.test(text)) {
-      push(`Tool ${toolName} was user-cancelled: ${textPreview}`);
     }
   }
 
-  return signals.slice(0, INTERRUPTION_SIGNAL_MAX);
+  return signals.slice(0, EXECUTION_BOUNDARY_SIGNAL_MAX);
 }
 
 function buildReflectionPrompt(
   conversationText: string,
   maxLearnings: number,
   storageMode: SelfLearningConfig["storage"]["mode"],
-  interruptionSignals: string[] = [],
+  executionSignals: string[] = [],
 ): string {
   const scopeRules =
     storageMode === "global"
@@ -544,18 +556,17 @@ function buildReflectionPrompt(
         ]
       : ["- Keep concrete details that are useful for this specific project/repository."];
 
-  const interruptionRules =
-    interruptionSignals.length > 0
+  const executionSignalRules =
+    executionSignals.length > 0
       ? [
-          "- Treat interruption/blocked/permission signals as intentional user-boundary evidence.",
-          "- Infer why the user stopped the flow and include at least one prevention-oriented mistake and one concrete fix for it.",
-          "- Do not frame user interruption as random failure.",
+          "- Treat blocked/permission signals as operational constraints from a completed turn.",
+          "- Include prevention-oriented mistakes/fixes only when they are directly relevant to the completed turn.",
         ]
       : [];
 
-  const interruptionSection =
-    interruptionSignals.length > 0
-      ? ["", "<interruption_signals>", ...interruptionSignals.map((line) => `- ${line}`), "</interruption_signals>"]
+  const executionSignalSection =
+    executionSignals.length > 0
+      ? ["", "<execution_boundary_signals>", ...executionSignals.map((line) => `- ${line}`), "</execution_boundary_signals>"]
       : [];
 
   return [
@@ -568,13 +579,14 @@ function buildReflectionPrompt(
     `- Keep each array short (max ${maxLearnings}).`,
     "- Prefer specific, actionable, prevention-oriented points.",
     "- Avoid generic statements and progress summaries.",
+    "- Ignore user-aborted or incomplete assistant responses; do not derive learnings from user aborts themselves.",
     ...scopeRules,
-    ...interruptionRules,
+    ...executionSignalRules,
     "",
     "<conversation>",
     conversationText,
     "</conversation>",
-    ...interruptionSection,
+    ...executionSignalSection,
   ].join("\n");
 }
 
@@ -690,6 +702,7 @@ function getBranchMessages(ctx: ExtensionContext, maxMessages: number): unknown[
   return entries
     .filter((e) => e.type === "message" && e.message)
     .map((e) => e.message)
+    .filter((message) => !isUserAbortMessage(message))
     .slice(-Math.max(1, maxMessages));
 }
 
@@ -1851,7 +1864,7 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
   const conversationText = serializeConversation(convertToLlm(messages as any));
   if (!conversationText.trim()) return { reason: "empty_conversation" };
 
-  const interruptionSignals = collectInterruptionSignals(ctx, Math.max(config.maxMessagesForReflection * 4, 24));
+  const executionSignals = collectExecutionBoundarySignals(ctx, Math.max(config.maxMessagesForReflection * 4, 24));
 
   const picked = await pickReflectionModel(config, ctx);
   if (!picked.model || !picked.auth) {
@@ -1877,7 +1890,7 @@ async function reflectNow(turnLabel: string, ctx: ExtensionContext): Promise<Ref
                   conversationText,
                   config.maxLearnings,
                   config.storage.mode,
-                  interruptionSignals,
+                  executionSignals,
                 ),
               },
             ],
@@ -2029,11 +2042,12 @@ async function generateMonthSummary(
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.on("agent_end", async (_event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     const settings = loadMergedSettings(ctx.cwd);
     const config = getSetting(settings, "selfLearning", DEFAULT_CONFIG) as SelfLearningConfig;
 
     if (!isLearningEnabled(config, ctx) || !isAutoReflectionEnabled(config)) return;
+    if (!didCompleteFullTurn(event.messages)) return;
     if (Date.now() < skipAutoReflectionUntil) return;
 
     try {
